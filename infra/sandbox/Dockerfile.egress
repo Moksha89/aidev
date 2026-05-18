@@ -1,0 +1,23 @@
+# infra/sandbox/Dockerfile.egress
+#
+# Egress allowlist sidecar for the sandbox containers. Built once by
+# the compose stack; the sandbox-runner attaches each per-task
+# `internal: true` network to this container at run time so the
+# sandbox can talk to the package mirrors and the model server but
+# nothing else.
+FROM alpine:3.20
+
+RUN apk add --no-cache tinyproxy ca-certificates tini \
+    && mkdir -p /run/tinyproxy \
+    && chown -R tinyproxy:tinyproxy /run/tinyproxy
+
+COPY tinyproxy.conf /etc/tinyproxy/tinyproxy.conf
+COPY filter /etc/tinyproxy/filter
+
+EXPOSE 8888
+
+HEALTHCHECK --interval=15s --timeout=3s --start-period=5s --retries=3 \
+    CMD wget -qO- --proxy=on --header='Host: aidev.invalid' \
+            http://127.0.0.1:8888/ >/dev/null 2>&1 || true
+
+ENTRYPOINT ["/sbin/tini", "--", "tinyproxy", "-d", "-c", "/etc/tinyproxy/tinyproxy.conf"]

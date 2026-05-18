@@ -1,0 +1,43 @@
+# infra/sandbox/filter
+#
+# Allowlist consumed by `/etc/tinyproxy/tinyproxy.conf`. Each line is
+# an anchored regex matched against the request's Host header.
+#
+# To regenerate after editing the Python source of truth
+# (`sandbox_runner.egress.DEFAULT_ALLOWLIST`):
+#
+#   poetry --directory workers/sandbox-runner run python -c \
+#       'from sandbox_runner.egress import build_allowlist, render_tinyproxy_filter; \
+#        print(render_tinyproxy_filter(build_allowlist()))' \
+#     > infra/sandbox/filter
+#
+# To add the model server host at deploy time, append the regex
+# manually (e.g. `^ollama\.aidev\.local$`) or set
+# `AIDEV_SANDBOX_MODEL_SERVER_HOST` and re-run the snippet above.
+
+# GitHub
+^github\.com$
+^api\.github\.com$
+^codeload\.github\.com$
+^objects\.githubusercontent\.com$
+^raw\.githubusercontent\.com$
+^[^.]+\.github\.com$
+^[^.]+\.githubusercontent\.com$
+
+# npm / pnpm / yarn
+^registry\.npmjs\.org$
+^registry\.yarnpkg\.com$
+^[^.]+\.npmjs\.org$
+
+# PyPI / Poetry
+^pypi\.org$
+^files\.pythonhosted\.org$
+^[^.]+\.pypi\.org$
+^[^.]+\.pythonhosted\.org$
+
+# OS package mirrors (Debian-based sandbox image)
+^deb\.debian\.org$
+^security\.debian\.org$
+^archive\.ubuntu\.com$
+^security\.ubuntu\.com$
+^ports\.ubuntu\.com$
