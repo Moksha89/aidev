@@ -62,9 +62,20 @@ class SandboxConfig:
     workspace_path: str = "/workspace"
 
     # Networking
+    #
+    # v0.2 architecture (kernel-level egress isolation):
+    #   * ``network_name_prefix``  — per-task ``internal: true`` bridge
+    #     where the agent + egress-proxy + forwarder live. No default
+    #     gateway, no MASQUERADE, no direct internet route.
+    #   * ``public_network_name_prefix`` — per-task PLAIN bridge that
+    #     holds the forwarder sidecar and absorbs the host's
+    #     ``-p 31xxx:3000`` mapping. The agent is NEVER on this network.
     network_name_prefix: str = "aidev_sandbox_"
+    public_network_name_prefix: str = "aidev_pub_"
     egress_proxy_url: str | None = None
     egress_proxy_alias: str = "aidev-egress-proxy"
+    forwarder_image: str = "aidev/forwarder:latest"
+    forwarder_name_prefix: str = "aidev-forwarder-"
     model_server_host: str | None = None
 
     # Preview mode: "port" (IP-only acceptance, default) or "traefik"
@@ -109,9 +120,18 @@ class SandboxConfig:
             network_name_prefix=_env_str(
                 "AIDEV_SANDBOX_NETWORK_PREFIX", "aidev_sandbox_"
             ),
+            public_network_name_prefix=_env_str(
+                "AIDEV_SANDBOX_PUBLIC_NETWORK_PREFIX", "aidev_pub_"
+            ),
             egress_proxy_url=_env_optional("AIDEV_SANDBOX_EGRESS_PROXY_URL"),
             egress_proxy_alias=_env_str(
                 "AIDEV_SANDBOX_EGRESS_PROXY_ALIAS", "aidev-egress-proxy"
+            ),
+            forwarder_image=_env_str(
+                "AIDEV_SANDBOX_FORWARDER_IMAGE", "aidev/forwarder:latest"
+            ),
+            forwarder_name_prefix=_env_str(
+                "AIDEV_SANDBOX_FORWARDER_PREFIX", "aidev-forwarder-"
             ),
             model_server_host=_env_optional("AIDEV_SANDBOX_MODEL_SERVER_HOST"),
             preview_mode=_env_str("AIDEV_SANDBOX_PREVIEW_MODE", "port").lower(),
@@ -148,10 +168,21 @@ class SandboxConfig:
         return _env_bool("AIDEV_SANDBOX_READ_ONLY_ROOTFS", default=True)
 
     def network_name(self, task_id: str) -> str:
+        """Per-task internal (no-default-route) sandbox bridge name."""
         return f"{self.network_name_prefix}{task_id}"
+
+    def public_network_name(self, task_id: str) -> str:
+        """Per-task plain bridge name. The forwarder sits here with the
+        host's ``-p 31xxx:3000`` mapping; the agent is never on this
+        network."""
+        return f"{self.public_network_name_prefix}{task_id}"
 
     def container_name(self, task_id: str) -> str:
         return f"aidev-sandbox-{task_id}"
+
+    def forwarder_name(self, task_id: str) -> str:
+        """Per-task forwarder sidecar container name."""
+        return f"{self.forwarder_name_prefix}{task_id}"
 
     def volume_name(self, task_id: str) -> str:
         return f"aidev-sandbox-vol-{task_id}"
