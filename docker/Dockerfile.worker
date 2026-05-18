@@ -21,8 +21,10 @@ RUN curl -sSL https://install.python-poetry.org | python3 -
 ENV PATH="${POETRY_HOME}/bin:${PATH}"
 
 WORKDIR /app
+# Path deps in workers/*/pyproject.toml reference ../../packages/*, so from
+# /app the relative path resolves to /packages/* — copy there, not /app/packages.
+COPY packages /packages
 COPY workers/${WORKER}/pyproject.toml workers/${WORKER}/poetry.lock* ./
-COPY packages packages
 
 RUN poetry install --no-root --without dev
 
