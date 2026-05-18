@@ -226,6 +226,164 @@ faked client to assert the full safety profile (resource caps, non-root,
 read-only rootfs, internal network, egress proxy attached, cleanup on
 exit).
 
+## Manual sandbox acceptance checklist
+
+Unit tests run against a faked Docker SDK and prove the *structure* of
+the executor (resource caps applied, cleanup ordered, rules engine
+called) — but they cannot prove the kernel actually denies a write or
+that tinyproxy actually blocks an unknown domain. Run this list
+**once on every host** before serving real tasks. Each step is a
+pass/fail gate. Do not skip.
+
+### 0. Build and bring up the stack
+
+```sh
+docker compose -f infra/docker-compose.yml build sandbox-runner egress-proxy
+docker compose -f infra/docker-compose.yml up -d traefik egress-proxy redis db api sandbox-runner
+SANDBOX_EXECUTOR=docker          # in infra/.env
+AIDEV_SANDBOX_MODEL_SERVER_HOST=<your-ollama-or-vllm-host>
+AIDEV_SANDBOX_PREVIEW_DOMAIN=<your-preview-domain>
+```
+
+### 1. Container safety profile (kernel-level)
+
+Open one task end-to-end through the dashboard; in another shell:
+
+```sh
+CID=$(docker ps --filter "label=aidev.sandbox=true" -q | head -1)
+docker inspect "$CID" --format '{{.HostConfig.Memory}}'         # → 4294967296   (4g)
+docker inspect "$CID" --format '{{.HostConfig.NanoCpus}}'       # → 2000000000   (2 cpus)
+docker inspect "$CID" --format '{{.HostConfig.PidsLimit}}'      # → 512
+docker inspect "$CID" --format '{{.HostConfig.ReadonlyRootfs}}' # → true
+docker inspect "$CID" --format '{{.HostConfig.SecurityOpt}}'    # contains   no-new-privileges:true
+docker inspect "$CID" --format '{{.HostConfig.CapDrop}}'        # → [ALL]
+docker inspect "$CID" --format '{{.Config.User}}'               # → 10001:10001
+docker inspect "$CID" --format '{{.HostConfig.NetworkMode}}'    # → aidev_sandbox_<task-id>
+docker network inspect aidev_sandbox_<task-id> --format '{{.Internal}}'  # → true
+```
+
+Every line must match the expected value. A miss = stop and
+investigate before serving traffic.
+
+### 2. Frontend-first filesystem protection actually blocks writes
+
+While a task is in `FRONTEND_CODING`:
+
+```sh
+docker exec -u 10001 "$CID" sh -c 'echo x > /workspace/apps/api/main.py'
+#  expect:  sh: ...: Permission denied      (exit code != 0)
+
+docker exec -u 10001 "$CID" sh -c 'echo x > /workspace/infra/docker-compose.yml'
+#  expect:  Permission denied
+
+docker exec -u 10001 "$CID" sh -c 'echo x > /workspace/.env'
+#  expect:  Permission denied
+
+docker exec -u 10001 "$CID" sh -c 'echo x > /workspace/apps/web/page.tsx'
+#  expect:  exit 0   (frontend writes are allowed)
+```
+
+Then drive the task to `BACKEND_UNLOCKED` from the dashboard:
+
+```sh
+docker exec -u 10001 "$CID" sh -c 'echo x > /workspace/apps/api/main.py'
+#  expect:  exit 0   (backend now writable)
+
+docker exec -u 10001 "$CID" sh -c 'echo x > /workspace/.env'
+#  expect:  Permission denied   (env files stay locked in EVERY phase)
+```
+
+### 3. Egress allowlist actually filters
+
+From inside the sandbox:
+
+```sh
+docker exec "$CID" env HTTPS_PROXY=http://aidev-egress-proxy:8888 \
+    curl -sS -o /dev/null -w '%{http_code}\n' https://api.github.com/zen
+#  expect:  200
+
+docker exec "$CID" env HTTPS_PROXY=http://aidev-egress-proxy:8888 \
+    curl -sS -o /dev/null -w '%{http_code}\n' https://attacker.test
+#  expect:  403   (or connection-error if DNS is also gated)
+
+# Anchor regression — should NOT match github.com prefix:
+docker exec "$CID" env HTTPS_PROXY=http://aidev-egress-proxy:8888 \
+    curl -sS -o /dev/null -w '%{http_code}\n' https://github.com.attacker.test
+#  expect:  403
+```
+
+Bypass test — sandbox has no default route, so without the proxy:
+
+```sh
+docker exec "$CID" curl --connect-timeout 3 -sS -o /dev/null -w '%{http_code}\n' https://1.1.1.1
+#  expect:  000   (connect timeout, no route)
+```
+
+### 4. Traefik preview registration is live in <1s
+
+Trigger `start_preview_server()` (the agent-runner does this when
+`frontend_qa` passes). Then:
+
+```sh
+ls -la infra/traefik/dynamic/tasks/
+#  expect:  task-<task-id>.yml exists, ~1 KB
+
+curl -sS -o /dev/null -w '%{http_code}\n' -H 'Host: task-<task-id>.preview.<DOMAIN>' http://localhost:80
+#  expect:  308 redirect to HTTPS (Traefik websecure)
+
+curl -sS -o /dev/null -w '%{http_code}\n' https://task-<task-id>.preview.<DOMAIN>
+#  expect:  200   (frontend dev server reachable)
+```
+
+Cancel / approve / fail the task → confirm:
+
+```sh
+ls infra/traefik/dynamic/tasks/task-<task-id>.yml
+#  expect:  No such file or directory
+
+curl -sS -o /dev/null -w '%{http_code}\n' https://task-<task-id>.preview.<DOMAIN>
+#  expect:  404 within ~1s
+```
+
+### 5. Cleanup on every exit path
+
+Trigger all four termination paths in separate tasks:
+
+| Path                    | Expected after exit                                                                                    |
+| ----------------------- | ------------------------------------------------------------------------------------------------------ |
+| `DONE` (happy path)     | `docker ps -a -f label=aidev.sandbox=true -f task=<id>` → empty; `docker volume ls -f name=<id>` empty; `docker network ls -f name=<id>` empty; preview YAML gone |
+| `REJECTED` after FE QA  | Same as above                                                                                          |
+| `CANCELLED` mid-run     | Same as above                                                                                          |
+| `FAILED` (uncaught exc) | Same as above. The executor `__aexit__` runs cleanup in a `finally`; one failed cleanup step must not skip the others |
+
+If any artefact survives, that is a leak — file an issue and do not
+serve more tasks until fixed.
+
+### 6. Timeout enforcement
+
+Submit a task whose plan deliberately sleeps for `AIDEV_SANDBOX_TIMEOUT_SECONDS + 60`:
+
+```sh
+# expect in the dashboard:
+#   - sandbox.failed event with payload.error = "task deadline exceeded"
+#   - task transitions to FAILED
+#   - container, volume, network, preview file all removed
+```
+
+### 7. Observability sanity
+
+```sh
+docker logs aidev-sandbox-runner --tail 50    # structured logs
+docker exec aidev-redis redis-cli SUBSCRIBE aidev.sandbox.events &
+# trigger a task → expect events: sandbox.starting, sandbox.started,
+# repo.cloned, fs_protection.applied, command.ran, preview.registered,
+# diff.captured, sandbox.finished
+```
+
+All seven sections must pass before flipping `SANDBOX_EXECUTOR=docker`
+for production traffic. Keep a dated copy of the run output in
+`docs/runs/` so you can show provenance later.
+
 ## Production deployment notes
 
 `DockerSandboxExecutor` needs read/write access to the host Docker
@@ -235,12 +393,23 @@ socket — that is the **only** privileged piece. Compose mounts it at
 
 Mitigations to remember:
 
-1. The worker process itself runs as non-root and only the executor
-   path code touches the SDK.
-2. The Traefik dynamic-tasks directory is bind-mounted writeable by the
-   worker but read-only-watched by Traefik.
-3. The egress proxy is the only path out of the per-task internal
-   network — losing the proxy = sandbox is fully offline (fail safe).
+1. **The worker process itself runs as a non-root user** and only the
+   executor path code touches the SDK. The Docker socket is not
+   exposed to the agent's sandbox containers — only to the worker.
+2. **The Traefik dynamic-tasks directory is bind-mounted writable by
+   the worker** but read-only-watched by Traefik (file provider). The
+   worker is the only writer.
+3. **The egress proxy is the only path out of the per-task internal
+   network** — losing the proxy = sandbox is fully offline (fail-safe,
+   not fail-open).
+4. **The sandbox container has no Docker socket and no host bind
+   mounts**, so even with root inside the sandbox (which it doesn't
+   have — UID 10001 + no-new-privileges), it cannot reach the host
+   filesystem or other containers.
+5. **The host Docker socket on the operator's box is the trust root.**
+   Anyone with write access to the socket can run arbitrary
+   containers as root on the host — so keep the VPS itself locked
+   down (SSH key only, no password auth, no public Docker API port).
 
 Future hardening tracked in
 [`docs/ROADMAP.md`](./ROADMAP.md): rootless Docker, sysbox or gVisor
