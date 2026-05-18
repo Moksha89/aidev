@@ -13,7 +13,7 @@ uvicorn = { extras = ["standard"], version = "^0.30" }
 sqlalchemy = "^2.0"
 alembic = "^1.13"
 psycopg = { extras = ["binary"], version = "^3.2" }
-pydantic = "^2.7"
+pydantic = { extras = ["email"], version = "^2.7" }
 pydantic-settings = "^2.4"
 python-jose = { extras = ["cryptography"], version = "^3.3" }
 passlib = { extras = ["bcrypt"], version = "^1.7" }
