@@ -35,16 +35,25 @@ reason. The evaluator is pure, total, and unit-tested.
 
 ### Layer 3 — Filesystem
 
-The sandbox mounts the workspace with a phase-aware overlay:
+After the sandbox clones the repo, the executor runs a generated shell
+script **as root inside the container** that flips backend paths to
+read-only using `chmod -R a-w,a+rX`:
 
-- `FRONTEND_CODING` phase: backend paths (`apps/api/**`, `migrations/**`,
-  `.env*`, `**/secrets/**`, `infra/**`, `**/.github/workflows/deploy*.yml`)
-  are mounted **read-only** via overlayfs. A write attempt fails with
-  `EROFS`.
-- `BACKEND_CODING` phase: the read-only overlay is dropped, but
-  `**/.env*` and `**/secrets/**` remain read-only.
+- `FRONTEND_CODING` / `FRONTEND_QA` / `AWAITING_APPROVAL`: backend paths
+  (`apps/api/**`, `workers/**`, `infra/**`, `docker/**`, `migrations/**`,
+  `alembic/**`, `.github/**`, `.env*`, `packages/{rules-engine,github-client,model-client}/**`)
+  are read-only. The agent runs as a non-root UID with
+  `no-new-privileges` and a read-only rootfs, so any write attempt
+  fails with `EACCES` at the kernel level.
+- `BACKEND_UNLOCKED` / `BACKEND_CODING` / `SECURITY_REVIEW`: backend
+  paths are restored to `u+rwX,go+rX`, but `.env*` stays locked in
+  every phase — secrets are forbidden post-approval too.
 
-This is the layer that protects you even if the rules engine has a bug.
+The protected path list and shell script are emitted by
+`sandbox_runner.fs_protection`. See
+[`docs/SANDBOX_EXECUTOR.md`](./SANDBOX_EXECUTOR.md) for the full
+design. This is the layer that protects you even if the rules engine
+has a bug.
 
 ### Layer 4 — Container
 
@@ -62,16 +71,21 @@ Each task runs in its own Docker container with:
 --network aidev_sandbox          # isolated bridge
 ```
 
-The container has no host bind-mounts, no docker socket, and no access to
-the host network. Egress is restricted to:
+The sandbox container has no host bind-mounts, no docker socket
+inside, and no host network access — it joins a per-task
+`internal: true` Docker network whose only egress is the
+`aidev-egress-proxy` tinyproxy sidecar. The proxy applies an anchored
+regex allowlist (deny-by-default) covering:
 
-- the model server (`MODEL_BASE_URL`),
-- the GitHub API (`api.github.com`, `*.githubusercontent.com`),
-- configured package registries (`registry.npmjs.org`, `pypi.org`,
-  `files.pythonhosted.org`).
+- the model server (`AIDEV_SANDBOX_MODEL_SERVER_HOST`),
+- GitHub (`*.github.com`, `*.githubusercontent.com`),
+- npm / pnpm / yarn registries (`registry.npmjs.org`, `*.npmjs.org`,
+  `registry.yarnpkg.com`),
+- PyPI / Poetry (`pypi.org`, `*.pythonhosted.org`),
+- Debian / Ubuntu OS mirrors.
 
-This is implemented by attaching the sandbox network to an outbound
-Squid/whitelist HTTP proxy and rejecting all other traffic via iptables.
+See [`docs/SANDBOX_EXECUTOR.md`](./SANDBOX_EXECUTOR.md) for the proxy
+design and how to add hosts.
 
 ### Layer 5 — Process
 

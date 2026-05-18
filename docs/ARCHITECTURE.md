@@ -51,8 +51,14 @@ subsystems see the other files in `docs/`.
                               ▼
 ┌──────────────────────────────────────────────────────────────┐
 │ workers/sandbox-runner — SandboxExecutor                     │
-│   MockSandboxExecutor  (default in MVP — runs in-process)    │
-│   DockerSandboxExecutor (planned — `docker run` per task)    │
+│   MockSandboxExecutor   (in-process — used for dev + CI)     │
+│   DockerSandboxExecutor (production — docker container per   │
+│                          task, non-root UID 10001, read-only │
+│                          rootfs, no-new-privileges, 2 CPU /  │
+│                          4 GB / 512 pids / 30-min timeout,   │
+│                          internal network + tinyproxy egress │
+│                          allowlist, Traefik preview routes)  │
+│   See docs/SANDBOX_EXECUTOR.md                               │
 └──────────────────────────────────────────────────────────────┘
                               │  OpenAI-compatible HTTP
                               ▼
@@ -135,8 +141,8 @@ mirror later), we can:
 | GitHub client        | Real, but wired to a feature flag                 |
 | Model client         | Real, points at `MODEL_BASE_URL`                  |
 | Agent orchestration  | Real Celery wiring; agent prompts are templates   |
-| Sandbox executor     | **Mock only.** Docker executor is stubbed.        |
-| Preview subdomains   | Traefik config drafted; no live dynamic provider  |
-| Playwright QA        | Stub returns canned screenshots                   |
+| Sandbox executor     | Real Docker executor + mock for dev/CI            |
+| Preview subdomains   | Traefik dynamic file provider, per-task routes    |
+| Playwright QA        | Real script generator; screenshots from sandbox   |
 
 See `docs/ROADMAP.md` for the path from MVP to v1.

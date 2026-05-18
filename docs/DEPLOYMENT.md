@@ -3,18 +3,27 @@
 This document covers deploying AI Developer to a Linux VPS with optional
 GPU. For a local dev setup see `INSTALLATION.md`.
 
+> **No production deployment is performed automatically.** The steps below
+> are reference only. We will run them on the actual hosts **only after the
+> sandbox runtime and security posture have been reviewed and approved.**
+
 ## Reference targets
 
 The project is being built against these initial hosts:
 
 | Host                  | Role                                            |
 | --------------------- | ----------------------------------------------- |
-| Ubuntu 24 LTS (GPU)   | Model server (Ollama/vLLM), API, workers, DB,   |
-|                       | sandbox containers, Traefik                     |
-| Windows 11 Pro VPS    | Optional manual-QA / RDP preview client only.   |
+| Ubuntu 24 LTS (GPU)   | Planned host for model server (Ollama/vLLM),    |
+|                       | FastAPI API, Postgres, Redis, Celery workers,   |
+|                       | Docker sandboxes, and Traefik.                  |
+| Windows 11 Pro VPS    | Dashboard preview / manual RDP-based QA only.   |
 |                       | **Does not** run the Linux Docker sandboxes.    |
 
-> Production credentials are loaded from environment / secret manager.
+> Credentials are loaded from environment / secret manager and referenced
+> by name only in this repository:
+> - `AIDEV_UBUNTU_VPS_PASSWORD` — Ubuntu GPU VPS administrator password.
+> - `AIDEV_WINDOWS_VPS_PASSWORD` — Windows 11 Pro VPS administrator password.
+>
 > Never commit them. Rotate any password that has appeared in chat.
 
 ## Topology

@@ -5,13 +5,13 @@ import { Badge } from "@/components/ui/badge";
 const SERVERS = [
   {
     name: "Ubuntu 24 LTS · GPU",
-    host: "69.197.142.77",
+    host: "gpu-vps.internal",
     role: "model server + API + workers + sandboxes",
     status: "planned",
   },
   {
     name: "Windows 11 Pro",
-    host: "204.12.245.84",
+    host: "qa-vps.internal",
     role: "manual QA / RDP preview only",
     status: "planned",
   },

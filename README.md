@@ -10,6 +10,12 @@ frontend-first approval gate** enforced in code, not just in prompts.
 > stubbed behind a `SandboxExecutor` interface and replaced with a mock
 > executor for local development. See `docs/ROADMAP.md` for what is real and
 > what is stubbed.
+>
+> **No production deployment yet.** Deployment to the planned hosts (see
+> `docs/DEPLOYMENT.md`) happens only after the sandbox + security design is
+> reviewed and approved. Host credentials are referenced via secret names
+> (`AIDEV_UBUNTU_VPS_PASSWORD`, `AIDEV_WINDOWS_VPS_PASSWORD`) and are never
+> stored in this repository.
 
 ---
 
