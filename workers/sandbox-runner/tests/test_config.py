@@ -18,6 +18,11 @@ def test_defaults_match_approved_design() -> None:
     assert cfg.image == "aidev/sandbox:latest"
     assert cfg.preview_internal_port == 3000
     assert cfg.read_only_root is True
+    # IP-only acceptance defaults: port-based previews on 31000-31999.
+    assert cfg.preview_mode == "port"
+    assert cfg.preview_public_host == "127.0.0.1"
+    assert cfg.preview_port_range_start == 31000
+    assert cfg.preview_port_range_end == 31999
 
 
 def test_from_env_overrides(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -37,6 +42,10 @@ def test_from_env_overrides(monkeypatch: pytest.MonkeyPatch) -> None:
         "AIDEV_SANDBOX_EXTRA_EGRESS_HOSTS",
         "mirrors.example.com, deb.example.org , ",
     )
+    monkeypatch.setenv("AIDEV_SANDBOX_PREVIEW_MODE", "traefik")
+    monkeypatch.setenv("AIDEV_SANDBOX_PREVIEW_HOST", "10.0.0.5")
+    monkeypatch.setenv("AIDEV_SANDBOX_PREVIEW_PORT_RANGE_START", "32100")
+    monkeypatch.setenv("AIDEV_SANDBOX_PREVIEW_PORT_RANGE_END", "32199")
 
     cfg = SandboxConfig.from_env()
 
@@ -49,6 +58,10 @@ def test_from_env_overrides(monkeypatch: pytest.MonkeyPatch) -> None:
     assert cfg.egress_proxy_url == "http://proxy.aidev.local:8888"
     assert cfg.model_server_host == "ollama.aidev.local"
     assert cfg.extra_egress_hosts == ("mirrors.example.com", "deb.example.org")
+    assert cfg.preview_mode == "traefik"
+    assert cfg.preview_public_host == "10.0.0.5"
+    assert cfg.preview_port_range_start == 32100
+    assert cfg.preview_port_range_end == 32199
 
 
 def test_per_task_naming_is_deterministic() -> None:

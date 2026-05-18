@@ -32,6 +32,8 @@ from dataclasses import dataclass, field
 from aidev_shared import TaskPhase
 
 from sandbox_runner.base import CommandResult
+from sandbox_runner.config import SandboxConfig
+from sandbox_runner.preview import PortPreviewRegistrar
 
 _PNG_STUB = (
     b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
@@ -47,6 +49,10 @@ class _MockSession:
     preview_url: str | None = None
     current_phase: TaskPhase = TaskPhase.FRONTEND_CODING
     evaluator: object | None = None
+    preview_mode: str = "port"
+    preview_public_host: str = "127.0.0.1"
+    preview_domain: str = "preview.aidev.local"
+    preview_host_port: int | None = None
     _phase_history: list[TaskPhase] = field(default_factory=list)
 
     def set_evaluator(self, evaluator: object) -> None:
@@ -172,9 +178,18 @@ class _MockSession:
         port: int | None = None,
     ) -> str:
         del command, port  # mock does not actually launch a server.
-        self.preview_url = (
-            f"https://task-{self.task_id}.preview.aidev.local"
-        )
+        if self.preview_mode == "port" and self.preview_host_port is not None:
+            self.preview_url = (
+                f"http://{self.preview_public_host}:{self.preview_host_port}"
+            )
+        elif self.preview_mode == "port":
+            # No port reserved (mock without registrar) — synthesize a
+            # placeholder so the dashboard can still render something.
+            self.preview_url = f"http://{self.preview_public_host}:31000"
+        else:
+            self.preview_url = (
+                f"https://task-{self.task_id}.{self.preview_domain}"
+            )
         return self.preview_url
 
 
@@ -194,7 +209,35 @@ def _write_bytes(path: str, content: bytes) -> None:
 
 
 class MockSandboxExecutor:
-    """In-process executor: creates a temp dir per session and cleans up."""
+    """In-process executor: creates a temp dir per session and cleans up.
+
+    Honours ``SandboxConfig.preview_mode`` so the dashboard sees the
+    same preview-URL shape the Docker executor would emit on the same
+    deployment. Port allocations are tracked by a shared
+    ``PortPreviewRegistrar`` so concurrent mock sessions never collide.
+    """
+
+    def __init__(
+        self,
+        *,
+        config: SandboxConfig | None = None,
+        port_registrar: PortPreviewRegistrar | None = None,
+    ) -> None:
+        self._config = config or SandboxConfig.from_env()
+        self._port_registrar = port_registrar
+
+    @property
+    def config(self) -> SandboxConfig:
+        return self._config
+
+    def _get_port_registrar(self) -> PortPreviewRegistrar:
+        if self._port_registrar is None:
+            self._port_registrar = PortPreviewRegistrar(
+                public_host=self._config.preview_public_host,
+                port_range_start=self._config.preview_port_range_start,
+                port_range_end=self._config.preview_port_range_end,
+            )
+        return self._port_registrar
 
     @asynccontextmanager
     async def session(
@@ -204,11 +247,27 @@ class MockSandboxExecutor:
         initial_phase: TaskPhase = TaskPhase.FRONTEND_CODING,
     ) -> AsyncIterator[_MockSession]:
         workspace = tempfile.mkdtemp(prefix=f"aidev-mock-{task_id}-")
+        mode = (self._config.preview_mode or "port").lower()
+        host_port: int | None = None
+        registrar: PortPreviewRegistrar | None = None
+        if mode == "port":
+            registrar = self._get_port_registrar()
+            allocation = registrar.allocate(
+                task_id=task_id,
+                internal_port=self._config.preview_internal_port,
+            )
+            host_port = allocation.host_port
         try:
             yield _MockSession(
                 task_id=task_id,
                 workspace_path=workspace,
                 current_phase=initial_phase,
+                preview_mode=mode,
+                preview_public_host=self._config.preview_public_host,
+                preview_domain=self._config.preview_domain,
+                preview_host_port=host_port,
             )
         finally:
+            if registrar is not None:
+                registrar.release(task_id)
             shutil.rmtree(workspace, ignore_errors=True)

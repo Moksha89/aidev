@@ -38,7 +38,12 @@ from sandbox_runner.fs_protection import (
     plan_for_phase,
     render_protection_script,
 )
-from sandbox_runner.preview import PreviewRegistrar, PreviewRoute
+from sandbox_runner.preview import (
+    PortAllocation,
+    PortPreviewRegistrar,
+    PreviewRegistrar,
+    PreviewRoute,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -61,7 +66,9 @@ class _DockerSession:
     container: Any
     config: SandboxConfig
     events: EventStream
-    preview_registrar: PreviewRegistrar
+    preview_registrar: PreviewRegistrar | None = None
+    port_registrar: PortPreviewRegistrar | None = None
+    port_allocation: PortAllocation | None = None
     preview_url: str | None = None
     current_phase: TaskPhase = TaskPhase.FRONTEND_CODING
     evaluator: Evaluator | None = None
@@ -315,8 +322,16 @@ class _DockerSession:
         command: str | None = None,
         port: int | None = None,
     ) -> str:
-        """Launch the frontend dev server inside the sandbox and register
-        the Traefik route. Returns the public preview URL.
+        """Launch the frontend dev server inside the sandbox and publish
+        the preview URL.
+
+        In ``port`` mode (IP-only acceptance) the URL is
+        ``http://<public-host>:<allocated-port>`` and the container's
+        published port was reserved before container create, so the
+        dev server is reachable as soon as it binds.
+
+        In ``traefik`` mode the registrar writes a dynamic file router
+        and the URL is ``https://task-<id>.preview.<DOMAIN>``.
         """
 
         chosen_port = port or self.config.preview_internal_port
@@ -328,6 +343,25 @@ class _DockerSession:
         await self.run(
             f"nohup {actual_command} > .aidev/preview.log 2>&1 &",
         )
+
+        if self.port_allocation is not None:
+            self.preview_url = self.port_allocation.public_url
+            self.events.publish(
+                task_id=self.task_id,
+                kind="preview.registered",
+                payload={
+                    "mode": "port",
+                    "public_url": self.preview_url,
+                    "host_port": self.port_allocation.host_port,
+                    "internal_port": chosen_port,
+                },
+            )
+            return self.preview_url
+
+        if self.preview_registrar is None:
+            raise SandboxLaunchError(
+                "no preview registrar configured for traefik mode"
+            )
         backend = f"http://{self.config.container_name(self.task_id)}:{chosen_port}"
         route = PreviewRoute(
             task_id=self.task_id,
@@ -340,6 +374,7 @@ class _DockerSession:
             task_id=self.task_id,
             kind="preview.registered",
             payload={
+                "mode": "traefik",
                 "domain": route.domain,
                 "backend_url": backend,
                 "dynamic_file": path,
@@ -411,11 +446,13 @@ class DockerSandboxExecutor:
         docker_client: Any | None = None,
         event_stream: EventStream | None = None,
         preview_registrar: PreviewRegistrar | None = None,
+        port_registrar: PortPreviewRegistrar | None = None,
     ) -> None:
         self._config = config or SandboxConfig.from_env()
         self._client = docker_client
         self._events = event_stream
         self._preview = preview_registrar
+        self._port_registrar = port_registrar
 
     @property
     def config(self) -> SandboxConfig:
@@ -451,6 +488,15 @@ class DockerSandboxExecutor:
             )
         return self._preview
 
+    def _get_port_registrar(self) -> PortPreviewRegistrar:
+        if self._port_registrar is None:
+            self._port_registrar = PortPreviewRegistrar(
+                public_host=self._config.preview_public_host,
+                port_range_start=self._config.preview_port_range_start,
+                port_range_end=self._config.preview_port_range_end,
+            )
+        return self._port_registrar
+
     @asynccontextmanager
     async def session(
         self,
@@ -460,7 +506,26 @@ class DockerSandboxExecutor:
     ) -> AsyncIterator[_DockerSession]:
         client = self._get_client()
         events = self._get_events()
-        preview = self._get_preview()
+
+        mode = (self._config.preview_mode or "port").lower()
+        if mode not in {"port", "traefik"}:
+            raise SandboxLaunchError(
+                f"unknown preview_mode {mode!r}; expected 'port' or 'traefik'"
+            )
+
+        # Allocate the preview slot up-front so port-mode containers can
+        # publish their host port at create time.
+        port_registrar: PortPreviewRegistrar | None = None
+        port_allocation: PortAllocation | None = None
+        traefik_registrar: PreviewRegistrar | None = None
+        if mode == "port":
+            port_registrar = self._get_port_registrar()
+            port_allocation = port_registrar.allocate(
+                task_id=task_id,
+                internal_port=self._config.preview_internal_port,
+            )
+        else:
+            traefik_registrar = self._get_preview()
 
         events.publish(
             task_id=task_id,
@@ -473,6 +538,10 @@ class DockerSandboxExecutor:
                 "agent_uid": self._config.agent_uid,
                 "read_only_root": self._config.read_only_root,
                 "timeout_seconds": self._config.task_timeout_seconds,
+                "preview_mode": mode,
+                "preview_host_port": (
+                    port_allocation.host_port if port_allocation else None
+                ),
             },
         )
 
@@ -498,6 +567,9 @@ class DockerSandboxExecutor:
             }
             env.update(proxy_env(proxy_url=self._config.egress_proxy_url))
 
+            port_bindings = (
+                port_allocation.port_bindings if port_allocation else None
+            )
             container = await asyncio.to_thread(
                 _create_container,
                 client=client,
@@ -506,6 +578,7 @@ class DockerSandboxExecutor:
                 volume_name=volume.name,
                 network_name=network.name,
                 environment=env,
+                port_bindings=port_bindings,
             )
             await asyncio.to_thread(container.start)
 
@@ -526,7 +599,9 @@ class DockerSandboxExecutor:
                 container=container,
                 config=self._config,
                 events=events,
-                preview_registrar=preview,
+                preview_registrar=traefik_registrar,
+                port_registrar=port_registrar,
+                port_allocation=port_allocation,
                 current_phase=initial_phase,
             )
             events.publish(
@@ -537,6 +612,7 @@ class DockerSandboxExecutor:
                     "network": network.name,
                     "volume": volume.name,
                     "phase": initial_phase.value,
+                    "preview_mode": mode,
                 },
             )
             yield session
@@ -548,10 +624,20 @@ class DockerSandboxExecutor:
             )
             raise
         finally:
-            try:
-                preview.deregister(task_id)
-            except Exception:  # pragma: no cover — best-effort cleanup
-                logger.warning("preview.deregister failed for task %s", task_id)
+            if port_registrar is not None:
+                try:
+                    port_registrar.release(task_id)
+                except Exception:  # pragma: no cover — best-effort cleanup
+                    logger.warning(
+                        "port_registrar.release failed for task %s", task_id
+                    )
+            if traefik_registrar is not None:
+                try:
+                    traefik_registrar.deregister(task_id)
+                except Exception:  # pragma: no cover — best-effort cleanup
+                    logger.warning(
+                        "preview.deregister failed for task %s", task_id
+                    )
             if container is not None:
                 try:
                     await asyncio.to_thread(container.remove, force=True, v=True)
@@ -611,6 +697,7 @@ def _create_container(
     volume_name: str,
     network_name: str,
     environment: dict[str, str],
+    port_bindings: dict[str, int] | None = None,
 ) -> Any:
     """Create the sandbox container with the full safety profile.
 
@@ -620,36 +707,40 @@ def _create_container(
       for the agent process (Playwright caches, pip wheels, etc.).
     * We do NOT bind-mount the host docker socket; the container has
       no way to reach the host daemon, period.
+    * `port_bindings` is only passed for ``preview_mode='port'`` —
+      Traefik mode keeps the container off the host port table.
     """
 
     nano_cpus = int(config.cpus * 1_000_000_000)
-    container = client.containers.create(
-        image=config.image,
-        name=config.container_name(task_id),
-        command=["sleep", "infinity"],
-        user=f"{config.agent_uid}:{config.agent_uid}",
-        working_dir=config.workspace_path,
-        environment=environment,
-        network=network_name,
-        read_only=config.read_only_root,
-        tmpfs={
+    create_kwargs: dict[str, Any] = {
+        "image": config.image,
+        "name": config.container_name(task_id),
+        "command": ["sleep", "infinity"],
+        "user": f"{config.agent_uid}:{config.agent_uid}",
+        "working_dir": config.workspace_path,
+        "environment": environment,
+        "network": network_name,
+        "read_only": config.read_only_root,
+        "tmpfs": {
             "/tmp": "rw,nosuid,nodev,exec,size=512m",
             "/home/agent/.cache": "rw,nosuid,nodev,size=512m",
         },
-        volumes={
+        "volumes": {
             volume_name: {"bind": config.workspace_path, "mode": "rw"},
         },
-        security_opt=["no-new-privileges:true"],
-        cap_drop=["ALL"],
-        mem_limit=config.mem_limit,
-        nano_cpus=nano_cpus,
-        pids_limit=config.pids_limit,
-        labels={
+        "security_opt": ["no-new-privileges:true"],
+        "cap_drop": ["ALL"],
+        "mem_limit": config.mem_limit,
+        "nano_cpus": nano_cpus,
+        "pids_limit": config.pids_limit,
+        "labels": {
             "com.aidev.task": task_id,
             "com.aidev.role": "sandbox",
         },
-    )
-    return container
+    }
+    if port_bindings:
+        create_kwargs["ports"] = port_bindings
+    return client.containers.create(**create_kwargs)
 
 
 def _attach_egress_proxy(*, client: Any, network: Any, alias: str) -> None:
