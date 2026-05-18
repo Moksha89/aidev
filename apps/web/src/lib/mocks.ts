@@ -320,7 +320,7 @@ export const mockModelServers: ModelServer[] = [
   {
     id: "m_vllm",
     name: "GPU vLLM (Ubuntu VPS)",
-    base_url: "http://69.197.142.77:8000/v1",
+    base_url: "http://gpu-vps.internal:8000/v1",
     model_identifier: "Qwen/Qwen2.5-Coder-32B-Instruct",
     server_type: "vllm",
     is_default: false,
