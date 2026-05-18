@@ -1,0 +1,53 @@
+# OS / editor
+.DS_Store
+*.swp
+.vscode/
+.idea/
+
+# Node
+node_modules/
+.next/
+out/
+dist/
+build/
+*.log
+.pnpm-store/
+.pnpm-debug.log*
+.npm/
+.yarn/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.venv/
+venv/
+.coverage
+htmlcov/
+
+# Env files (NEVER commit)
+.env
+.env.local
+.env.*.local
+!.env.example
+
+# Docker volumes / runtime
+data/
+postgres-data/
+redis-data/
+sandbox-workspaces/
+
+# Playwright
+playwright-report/
+test-results/
+screenshots/
+
+# Misc
+*.tsbuildinfo
+.turbo/
+coverage/

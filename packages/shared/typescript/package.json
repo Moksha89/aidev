@@ -1,0 +1,15 @@
+{
+  "name": "@aidev/shared",
+  "version": "0.1.0",
+  "description": "Shared enums and types for the AI Developer platform.",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "lint": "tsc --noEmit -p tsconfig.json"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.0"
+  },
+  "license": "MIT"
+}

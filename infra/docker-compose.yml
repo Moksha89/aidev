@@ -1,0 +1,148 @@
+# infra/docker-compose.yml — Local + single-node production layout.
+#
+# This is the same file you can ship to the Ubuntu VPS. It does NOT
+# include the model server because that's expected to be `ollama` /
+# `vllm` running on the host (so it can talk to the GPU directly). The
+# AIDEV_MODEL_BASE_URL env var points at it.
+#
+# Bring up:  docker compose -f infra/docker-compose.yml up -d --build
+# Stop:      docker compose -f infra/docker-compose.yml down
+#
+# Sandboxes are launched ON DEMAND by the sandbox-runner worker via the
+# host docker socket; they don't appear in this file.
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${AIDEV_DB_NAME:-aidev}
+      POSTGRES_USER: ${AIDEV_DB_USER:-aidev}
+      POSTGRES_PASSWORD: ${AIDEV_DB_PASSWORD:?required}
+    volumes:
+      - aidev_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${AIDEV_DB_USER:-aidev} -d ${AIDEV_DB_NAME:-aidev}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - aidev_redis:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  api:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.api
+    restart: unless-stopped
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    environment:
+      AIDEV_DATABASE_URL: postgresql+psycopg://${AIDEV_DB_USER:-aidev}:${AIDEV_DB_PASSWORD}@postgres:5432/${AIDEV_DB_NAME:-aidev}
+      AIDEV_REDIS_URL: redis://redis:6379/0
+      AIDEV_SECRET_KEY: ${AIDEV_SECRET_KEY:?required}
+      AIDEV_MODEL_BASE_URL: ${AIDEV_MODEL_BASE_URL:-http://host.docker.internal:11434/v1}
+      AIDEV_DEFAULT_MODEL: ${AIDEV_DEFAULT_MODEL:-llama3.1:8b-instruct}
+      AIDEV_ADMIN_EMAIL: ${AIDEV_ADMIN_EMAIL:-admin@example.com}
+      AIDEV_ADMIN_PASSWORD: ${AIDEV_ADMIN_PASSWORD:?required}
+      AIDEV_CORS_ORIGINS: ${AIDEV_CORS_ORIGINS:-http://localhost:3000}
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.aidev-api.rule=Host(`api.${AIDEV_DOMAIN:-aidev.local}`)
+      - traefik.http.routers.aidev-api.entrypoints=websecure
+      - traefik.http.routers.aidev-api.tls=true
+      - traefik.http.services.aidev-api.loadbalancer.server.port=8000
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  web:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.web
+    restart: unless-stopped
+    depends_on:
+      - api
+    environment:
+      NEXT_PUBLIC_API_BASE_URL: https://api.${AIDEV_DOMAIN:-aidev.local}
+      NEXT_PUBLIC_APP_NAME: ${NEXT_PUBLIC_APP_NAME:-AI Developer}
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.aidev-web.rule=Host(`${AIDEV_DOMAIN:-aidev.local}`)
+      - traefik.http.routers.aidev-web.entrypoints=websecure
+      - traefik.http.routers.aidev-web.tls=true
+      - traefik.http.services.aidev-web.loadbalancer.server.port=3000
+
+  agent-runner:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.worker
+      args:
+        WORKER: agent-runner
+    restart: unless-stopped
+    depends_on:
+      redis: { condition: service_healthy }
+      postgres: { condition: service_healthy }
+    environment:
+      AIDEV_DATABASE_URL: postgresql+psycopg://${AIDEV_DB_USER:-aidev}:${AIDEV_DB_PASSWORD}@postgres:5432/${AIDEV_DB_NAME:-aidev}
+      AIDEV_REDIS_URL: redis://redis:6379/0
+      AIDEV_MODEL_BASE_URL: ${AIDEV_MODEL_BASE_URL:-http://host.docker.internal:11434/v1}
+      AIDEV_DEFAULT_MODEL: ${AIDEV_DEFAULT_MODEL:-llama3.1:8b-instruct}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  sandbox-runner:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.worker
+      args:
+        WORKER: sandbox-runner
+    restart: unless-stopped
+    depends_on:
+      redis: { condition: service_healthy }
+      postgres: { condition: service_healthy }
+    environment:
+      AIDEV_DATABASE_URL: postgresql+psycopg://${AIDEV_DB_USER:-aidev}:${AIDEV_DB_PASSWORD}@postgres:5432/${AIDEV_DB_NAME:-aidev}
+      AIDEV_REDIS_URL: redis://redis:6379/0
+      AIDEV_SANDBOX_IMAGE: aidev/sandbox:latest
+    volumes:
+      # Read-only docker socket so the worker can `docker run` sandbox
+      # containers on the host. This is the v0.1 design — the v0.2
+      # design proposed in the PR description swaps this for a
+      # dedicated DinD sidecar.
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+
+  traefik:
+    image: traefik:v3.1
+    restart: unless-stopped
+    command:
+      - --providers.docker=true
+      - --providers.docker.exposedbydefault=false
+      - --entrypoints.web.address=:80
+      - --entrypoints.websecure.address=:443
+      - --entrypoints.web.http.redirections.entrypoint.to=websecure
+      - --entrypoints.web.http.redirections.entrypoint.scheme=https
+      - --providers.file.directory=/etc/traefik/dynamic
+      - --providers.file.watch=true
+      - --api.dashboard=false
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./traefik/dynamic:/etc/traefik/dynamic:ro
+      - aidev_traefik_certs:/letsencrypt
+
+volumes:
+  aidev_pgdata:
+  aidev_redis:
+  aidev_traefik_certs:

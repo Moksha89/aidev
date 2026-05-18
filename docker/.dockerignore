@@ -1,0 +1,18 @@
+# Build context exclusions shared across every Dockerfile in /docker/.
+**/.git
+**/.github
+**/node_modules
+**/.next
+**/.venv
+**/__pycache__
+**/.pytest_cache
+**/.mypy_cache
+**/.ruff_cache
+**/dist
+**/build
+**/coverage
+**/playwright-report
+**/test-results
+.env
+.env.*
+**/*.local

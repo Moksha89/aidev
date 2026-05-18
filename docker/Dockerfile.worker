@@ -1,0 +1,51 @@
+# Dockerfile.worker — Celery workers (agent-runner + sandbox-runner)
+#
+# Single image, parameterised by the WORKER target so we can spin up
+# the agent-runner and the sandbox-runner without maintaining two
+# nearly-identical Dockerfiles.
+ARG WORKER=agent-runner
+
+FROM python:3.11-slim-bookworm AS build
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    POETRY_HOME=/opt/poetry \
+    POETRY_VIRTUALENVS_IN_PROJECT=true \
+    POETRY_NO_INTERACTION=1
+
+ARG WORKER
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential curl git \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN curl -sSL https://install.python-poetry.org | python3 -
+ENV PATH="${POETRY_HOME}/bin:${PATH}"
+
+WORKDIR /app
+COPY workers/${WORKER}/pyproject.toml workers/${WORKER}/poetry.lock* ./
+COPY packages packages
+
+RUN poetry install --no-root --without dev
+
+COPY workers/${WORKER}/${WORKER//-/_} ./${WORKER//-/_}
+
+FROM python:3.11-slim-bookworm AS runtime
+ARG WORKER
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PATH="/app/.venv/bin:${PATH}" \
+    WORKER_NAME=${WORKER}
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        git curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN useradd --uid 10001 --create-home aidev
+WORKDIR /app
+COPY --from=build /app /app
+COPY --from=build /packages /packages
+USER 10001
+
+# Worker name must match the Celery app's module path.
+# - agent-runner   -> agent_runner.worker
+# - sandbox-runner -> sandbox_runner.worker
+CMD ["sh", "-c", "celery -A ${WORKER_NAME//-/_}.worker worker --loglevel=INFO --concurrency=2"]

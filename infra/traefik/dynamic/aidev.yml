@@ -1,0 +1,30 @@
+# infra/traefik/dynamic/aidev.yml — Static middleware definitions.
+#
+# Per-task preview routers are written dynamically by the
+# sandbox-runner worker into the same directory at runtime
+# (e.g. task-<id>.yml) so they can be reloaded without restarting
+# Traefik. This file holds only middleware that's shared by every
+# router.
+
+http:
+  middlewares:
+    aidev-security-headers:
+      headers:
+        browserXssFilter: true
+        contentTypeNosniff: true
+        forceSTSHeader: true
+        stsIncludeSubdomains: true
+        stsPreload: true
+        stsSeconds: 31536000
+        referrerPolicy: strict-origin-when-cross-origin
+        customResponseHeaders:
+          X-Frame-Options: SAMEORIGIN
+          X-Powered-By: ""
+
+    aidev-rate-limit:
+      rateLimit:
+        average: 100
+        burst: 200
+
+    aidev-compress:
+      compress: {}

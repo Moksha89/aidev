@@ -1,0 +1,26 @@
+[tool.poetry]
+name = "aidev-model-client"
+version = "0.1.0"
+description = "OpenAI-compatible chat completions client for the AI Developer platform."
+authors = ["Moksha89"]
+readme = "README.md"
+packages = [{ include = "aidev_model_client" }]
+
+[tool.poetry.dependencies]
+python = "^3.11"
+httpx = "^0.27"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^8.0"
+ruff = "^0.6"
+
+[build-system]
+requires = ["poetry-core>=1.8.0"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "N", "SIM"]

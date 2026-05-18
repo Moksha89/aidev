@@ -1,0 +1,30 @@
+[tool.poetry]
+name = "aidev-sandbox-runner"
+version = "0.1.0"
+description = "Sandbox executor (mock + docker) for the AI Developer platform."
+authors = ["Moksha89"]
+readme = "README.md"
+packages = [{ include = "sandbox_runner" }]
+
+[tool.poetry.dependencies]
+python = "^3.11"
+celery = { extras = ["redis"], version = "^5.4" }
+docker = "^7.1"
+aidev-shared = { path = "../../packages/shared/python", develop = true }
+aidev-rules-engine = { path = "../../packages/rules-engine", develop = true }
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^8.0"
+pytest-asyncio = "^0.23"
+ruff = "^0.6"
+
+[build-system]
+requires = ["poetry-core>=1.8.0"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "N", "SIM"]
