@@ -20,7 +20,7 @@ from aidev_shared import TaskPhase
 
 from sandbox_runner.config import SandboxConfig
 from sandbox_runner.docker_executor import DockerSandboxExecutor
-from sandbox_runner.preview import PreviewRegistrar
+from sandbox_runner.preview import PortPreviewRegistrar, PreviewRegistrar
 
 # ---- fake docker SDK ------------------------------------------------------
 
@@ -181,6 +181,8 @@ def fake_client() -> _FakeDocker:
 
 @pytest.fixture
 def config(tmp_path: Path) -> SandboxConfig:
+    """Port-based preview mode — the IP-only acceptance default."""
+
     return SandboxConfig(
         image="aidev/sandbox:test",
         cpus=2.0,
@@ -191,6 +193,10 @@ def config(tmp_path: Path) -> SandboxConfig:
         egress_proxy_url="http://aidev-egress-proxy:8888",
         egress_proxy_alias="aidev-egress-proxy",
         model_server_host="ollama.aidev.local",
+        preview_mode="port",
+        preview_public_host="203.0.113.10",
+        preview_port_range_start=31000,
+        preview_port_range_end=31099,
         traefik_dynamic_dir=str(tmp_path / "traefik-dynamic"),
         preview_domain="preview.aidev.local",
         redis_url="redis://ignored",
@@ -198,8 +204,28 @@ def config(tmp_path: Path) -> SandboxConfig:
 
 
 @pytest.fixture
-def executor(
-    fake_client: _FakeDocker, config: SandboxConfig
+def traefik_config(tmp_path: Path) -> SandboxConfig:
+    """Domain-based preview mode — future production path."""
+
+    return SandboxConfig(
+        image="aidev/sandbox:test",
+        cpus=2.0,
+        mem_limit="4g",
+        pids_limit=512,
+        task_timeout_seconds=1800,
+        agent_uid=10001,
+        egress_proxy_url="http://aidev-egress-proxy:8888",
+        egress_proxy_alias="aidev-egress-proxy",
+        model_server_host="ollama.aidev.local",
+        preview_mode="traefik",
+        traefik_dynamic_dir=str(tmp_path / "traefik-dynamic"),
+        preview_domain="preview.aidev.local",
+        redis_url="redis://ignored",
+    )
+
+
+def _build_executor(
+    *, config: SandboxConfig, fake_client: _FakeDocker
 ) -> DockerSandboxExecutor:
     from sandbox_runner.event_stream import EventStream
 
@@ -218,8 +244,29 @@ def executor(
             channel=config.event_channel,
             client=_NullClient(),
         ),
-        preview_registrar=PreviewRegistrar(dynamic_dir=config.traefik_dynamic_dir),
+        preview_registrar=PreviewRegistrar(
+            dynamic_dir=config.traefik_dynamic_dir
+        ),
+        port_registrar=PortPreviewRegistrar(
+            public_host=config.preview_public_host,
+            port_range_start=config.preview_port_range_start,
+            port_range_end=config.preview_port_range_end,
+        ),
     )
+
+
+@pytest.fixture
+def executor(
+    fake_client: _FakeDocker, config: SandboxConfig
+) -> DockerSandboxExecutor:
+    return _build_executor(config=config, fake_client=fake_client)
+
+
+@pytest.fixture
+def traefik_executor(
+    fake_client: _FakeDocker, traefik_config: SandboxConfig
+) -> DockerSandboxExecutor:
+    return _build_executor(config=traefik_config, fake_client=fake_client)
 
 
 # ---- tests ----------------------------------------------------------------
@@ -337,21 +384,75 @@ async def test_set_phase_runs_protection_script(
 
 @pytest.mark.asyncio
 async def test_start_preview_server_registers_traefik_route(
-    executor: DockerSandboxExecutor, config: SandboxConfig
+    traefik_executor: DockerSandboxExecutor, traefik_config: SandboxConfig
 ) -> None:
-    async with executor.session(task_id="abc") as session:
+    async with traefik_executor.session(task_id="abc") as session:
         url = await session.start_preview_server(command="echo dev-server")
         assert url == "https://task-abc.preview.aidev.local"
         assert session.preview_url == url
 
-        dynamic_file = Path(config.traefik_dynamic_dir) / "task-abc.yml"
+        dynamic_file = (
+            Path(traefik_config.traefik_dynamic_dir) / "task-abc.yml"
+        )
         assert dynamic_file.exists()
         content = dynamic_file.read_text(encoding="utf-8")
         assert "task-abc.preview.aidev.local" in content
         assert "http://aidev-sandbox-abc:3000" in content
 
     # Session exit deregisters the route.
-    assert not (Path(config.traefik_dynamic_dir) / "task-abc.yml").exists()
+    assert not (
+        Path(traefik_config.traefik_dynamic_dir) / "task-abc.yml"
+    ).exists()
+
+
+@pytest.mark.asyncio
+async def test_port_mode_publishes_host_port_on_container(
+    executor: DockerSandboxExecutor, fake_client: _FakeDocker
+) -> None:
+    async with executor.session(task_id="abc"):
+        pass
+
+    container = fake_client.containers.created[0]
+    # Port-mode containers must publish the allocated host port on the
+    # internal preview port.
+    assert container.create_kwargs.get("ports") == {"3000/tcp": 31000}
+
+
+@pytest.mark.asyncio
+async def test_port_mode_start_preview_server_returns_ip_url(
+    executor: DockerSandboxExecutor, config: SandboxConfig
+) -> None:
+    async with executor.session(task_id="abc") as session:
+        url = await session.start_preview_server(command="echo dev-server")
+        # IP-only acceptance URL: http://<public-host>:<allocated-port>
+        assert url == f"http://{config.preview_public_host}:31000"
+        assert session.preview_url == url
+
+
+@pytest.mark.asyncio
+async def test_port_mode_releases_allocation_on_exit(
+    executor: DockerSandboxExecutor,
+) -> None:
+    async with executor.session(task_id="abc") as session:
+        await session.start_preview_server(command="echo dev-server")
+    # After exit the same port is free again for a new task.
+    async with executor.session(task_id="def") as session2:
+        url = await session2.start_preview_server(command="echo dev-server")
+        # First allocation reused since the previous task released it.
+        assert url.endswith(":31000")
+
+
+@pytest.mark.asyncio
+async def test_traefik_mode_does_not_publish_host_ports(
+    traefik_executor: DockerSandboxExecutor, fake_client: _FakeDocker
+) -> None:
+    async with traefik_executor.session(task_id="abc"):
+        pass
+
+    container = fake_client.containers.created[0]
+    # Domain-mode containers stay off the host port table — Traefik
+    # reaches them on the docker bridge instead.
+    assert "ports" not in container.create_kwargs
 
 
 @pytest.mark.asyncio

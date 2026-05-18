@@ -9,6 +9,7 @@ import pytest
 from aidev_shared import TaskPhase
 
 from sandbox_runner import MockSandboxExecutor
+from sandbox_runner.config import SandboxConfig
 
 
 @pytest.mark.asyncio
@@ -94,13 +95,50 @@ async def test_capture_screenshots_writes_stub_pngs() -> None:
 
 
 @pytest.mark.asyncio
-async def test_start_preview_server_records_url() -> None:
-    executor = MockSandboxExecutor()
+async def test_start_preview_server_records_port_mode_url() -> None:
+    # IP-only acceptance default: port mode.
+    config = SandboxConfig(
+        preview_mode="port",
+        preview_public_host="203.0.113.10",
+        preview_port_range_start=31000,
+        preview_port_range_end=31010,
+    )
+    executor = MockSandboxExecutor(config=config)
     async with executor.session(task_id="abc") as sandbox:
         assert sandbox.preview_url is None
         url = await sandbox.start_preview_server()
-        assert url == "https://task-abc.preview.aidev.local"
+        assert url == "http://203.0.113.10:31000"
         assert sandbox.preview_url == url
+
+
+@pytest.mark.asyncio
+async def test_start_preview_server_records_traefik_mode_url() -> None:
+    config = SandboxConfig(
+        preview_mode="traefik",
+        preview_domain="preview.example.com",
+    )
+    executor = MockSandboxExecutor(config=config)
+    async with executor.session(task_id="abc") as sandbox:
+        url = await sandbox.start_preview_server()
+        assert url == "https://task-abc.preview.example.com"
+        assert sandbox.preview_url == url
+
+
+@pytest.mark.asyncio
+async def test_mock_executor_releases_port_on_exit() -> None:
+    config = SandboxConfig(
+        preview_mode="port",
+        preview_public_host="203.0.113.10",
+        preview_port_range_start=31000,
+        preview_port_range_end=31010,
+    )
+    executor = MockSandboxExecutor(config=config)
+    async with executor.session(task_id="abc") as sandbox:
+        first = await sandbox.start_preview_server()
+    async with executor.session(task_id="def") as sandbox2:
+        second = await sandbox2.start_preview_server()
+    # First port is recycled because the previous session released it.
+    assert first == second == "http://203.0.113.10:31000"
 
 
 @pytest.mark.asyncio

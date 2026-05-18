@@ -67,10 +67,22 @@ class SandboxConfig:
     egress_proxy_alias: str = "aidev-egress-proxy"
     model_server_host: str | None = None
 
-    # Traefik preview
+    # Preview mode: "port" (IP-only acceptance, default) or "traefik"
+    # (domain-based, future production). Port mode allocates one host
+    # port per task from the configured range and exposes the dev server
+    # directly. Traefik mode writes a dynamic file router and routes by
+    # `task-<id>.preview.<DOMAIN>`.
+    preview_mode: str = "port"
+    preview_internal_port: int = 3000
+
+    # Port-based preview (preview_mode == "port")
+    preview_public_host: str = "127.0.0.1"
+    preview_port_range_start: int = 31000
+    preview_port_range_end: int = 31999
+
+    # Traefik preview (preview_mode == "traefik")
     traefik_dynamic_dir: str = "/etc/traefik/dynamic/tasks"
     preview_domain: str = "preview.aidev.local"
-    preview_internal_port: int = 3000
 
     # Event stream
     redis_url: str = "redis://localhost:6379/0"
@@ -102,13 +114,23 @@ class SandboxConfig:
                 "AIDEV_SANDBOX_EGRESS_PROXY_ALIAS", "aidev-egress-proxy"
             ),
             model_server_host=_env_optional("AIDEV_SANDBOX_MODEL_SERVER_HOST"),
+            preview_mode=_env_str("AIDEV_SANDBOX_PREVIEW_MODE", "port").lower(),
+            preview_internal_port=_env_int("AIDEV_SANDBOX_PREVIEW_PORT", 3000),
+            preview_public_host=_env_str(
+                "AIDEV_SANDBOX_PREVIEW_HOST", "127.0.0.1"
+            ),
+            preview_port_range_start=_env_int(
+                "AIDEV_SANDBOX_PREVIEW_PORT_RANGE_START", 31000
+            ),
+            preview_port_range_end=_env_int(
+                "AIDEV_SANDBOX_PREVIEW_PORT_RANGE_END", 31999
+            ),
             traefik_dynamic_dir=_env_str(
                 "AIDEV_SANDBOX_TRAEFIK_DYNAMIC_DIR", "/etc/traefik/dynamic/tasks"
             ),
             preview_domain=_env_str(
                 "AIDEV_SANDBOX_PREVIEW_DOMAIN", "preview.aidev.local"
             ),
-            preview_internal_port=_env_int("AIDEV_SANDBOX_PREVIEW_PORT", 3000),
             redis_url=_env_str("AIDEV_REDIS_URL", "redis://localhost:6379/0"),
             event_channel=_env_str(
                 "AIDEV_SANDBOX_EVENT_CHANNEL", "aidev.sandbox.events"

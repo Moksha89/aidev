@@ -28,9 +28,10 @@ Select via `SANDBOX_EXECUTOR=docker` (defaults to `mock`). See
    `internal: true` Docker network; the only path out is the
    `aidev-egress-proxy` (tinyproxy) sidecar, which deny-by-defaults
    anything not on the allowlist.
-4. **Cleanup is not optional.** Container, volume, network, and Traefik
-   route are all removed in a `finally` block; if any step fails it is
-   logged but the others still run.
+4. **Cleanup is not optional.** Container, volume, network, and preview
+   registration (port allocation in IP-only mode, or Traefik dynamic
+   file in domain mode) are all removed in a `finally` block; if any
+   step fails it is logged but the others still run.
 
 ## Container safety profile
 
@@ -127,22 +128,63 @@ The proxy itself is configured in
 per host (`^github\.com$`, `^[^.]+\.pypi\.org$`, …) so
 `github.com.attacker.test` does not match `github.com`.
 
-## Preview routing through Traefik
+## Preview routing
 
-When the frontend dev server is ready,
-`session.start_preview_server()` writes a small dynamic config to
+The sandbox supports two preview-registration backends. The active one
+is selected by `AIDEV_SANDBOX_PREVIEW_MODE` (default `port`).
+
+### `port` mode — IP-only acceptance (default)
+
+Used for the controlled Ubuntu host acceptance run and any environment
+where DNS / TLS is not desired. The executor allocates one host port
+from `AIDEV_SANDBOX_PREVIEW_PORT_RANGE_START..END` (default 31000-31999)
+**before** creating the container and publishes it via the standard
+Docker `ports` map: `host:<allocated>` → `container:3000`. The dev
+server becomes reachable at
+`http://<AIDEV_SANDBOX_PREVIEW_HOST>:<allocated>` as soon as it binds.
+
+The pool is in-memory and process-local — one sandbox-runner owns it.
+Allocation is thread-safe (`PortPreviewRegistrar`), idempotent on
+`task_id` (re-calls return the same port), and released on session
+exit so the next task can reuse the slot.
+
+```
+   task A allocate -> 31000   (http://<host>:31000)
+   task B allocate -> 31001   (http://<host>:31001)
+   task A finishes -> release(31000)
+   task C allocate -> 31000   (recycled)
+```
+
+When the pool is exhausted, `PortPoolExhaustedError` propagates and the
+task transitions to `FAILED` rather than colliding on a port. Pick a
+range wide enough for your peak concurrent task count (1000 slots is
+plenty for the acceptance run).
+
+### `traefik` mode — future domain-based production
+
+Kept as the production path. `session.start_preview_server()` writes
+a small dynamic config to
 `infra/traefik/dynamic/tasks/task-<task_id>.yml`. Traefik's file
 provider picks it up automatically (no reload) and serves
 `https://task-<task_id>.preview.<DOMAIN>` → sandbox container port
-3000.
+3000. In this mode the container is **not** published on a host port
+— Traefik reaches it on the docker bridge by service name.
 
 The generated config attaches three Traefik middlewares —
 `aidev-security-headers`, `aidev-rate-limit`, `aidev-compress` — so
 preview URLs get HSTS / X-Content-Type-Options / a basic rate limit
 out of the box.
 
-On session exit `preview.deregister(task_id)` removes the dynamic file
-and Traefik tears the route down within ~1 second.
+### Cleanup
+
+On session exit:
+- `port` mode: `PortPreviewRegistrar.release(task_id)` frees the slot
+  immediately; the container teardown removes the host port binding.
+- `traefik` mode: `PreviewRegistrar.deregister(task_id)` removes the
+  dynamic file and Traefik tears the route down within ~1 second.
+
+In both modes failure of one cleanup step does not skip the others
+(container, volume, network are still removed in the `finally`).
 
 ## Log / diff / screenshot capture
 
@@ -193,8 +235,12 @@ via env vars in `infra/.env`:
 | `AIDEV_SANDBOX_EGRESS_PROXY_URL`       | `http://aidev-egress-proxy:8888` | Upstream proxy for HTTP(S)_PROXY env                         |
 | `AIDEV_SANDBOX_MODEL_SERVER_HOST`      | *unset*                       | Hostname of Ollama/vLLM, added to allowlist                  |
 | `AIDEV_SANDBOX_EXTRA_EGRESS_HOSTS`     | *unset*                       | Comma-separated extra allowlist entries                      |
-| `AIDEV_SANDBOX_TRAEFIK_DYNAMIC_DIR`    | `/etc/traefik/dynamic/tasks`  | Where to drop per-task router YAML                           |
-| `AIDEV_SANDBOX_PREVIEW_DOMAIN`         | `preview.aidev.local`         | Base domain for `task-<id>.preview.<DOMAIN>`                 |
+| `AIDEV_SANDBOX_PREVIEW_MODE`           | `port`                        | `port` (IP-only acceptance) or `traefik` (domain-based)      |
+| `AIDEV_SANDBOX_PREVIEW_HOST`           | `127.0.0.1`                   | Public hostname/IP advertised in `port`-mode preview URLs    |
+| `AIDEV_SANDBOX_PREVIEW_PORT_RANGE_START` | `31000`                     | First host port the registrar can hand out (`port` mode)     |
+| `AIDEV_SANDBOX_PREVIEW_PORT_RANGE_END`   | `31999`                     | Last host port the registrar can hand out (`port` mode)      |
+| `AIDEV_SANDBOX_TRAEFIK_DYNAMIC_DIR`    | `/etc/traefik/dynamic/tasks`  | Where to drop per-task router YAML (`traefik` mode)          |
+| `AIDEV_SANDBOX_PREVIEW_DOMAIN`         | `preview.aidev.local`         | Base domain for `task-<id>.preview.<DOMAIN>` (`traefik` mode)|
 | `AIDEV_SANDBOX_PREVIEW_PORT`           | `3000`                        | Internal port that the dev server listens on                 |
 | `AIDEV_SANDBOX_READ_ONLY_ROOTFS`       | `true`                        | Mount root FS read-only (only flip for debugging)            |
 | `AIDEV_REDIS_URL`                      | `redis://localhost:6379/0`    | Pub/sub channel for sandbox events                           |
@@ -240,8 +286,23 @@ pass/fail gate. Do not skip.
 ```sh
 docker compose -f infra/docker-compose.yml build sandbox-runner egress-proxy
 docker compose -f infra/docker-compose.yml up -d traefik egress-proxy redis db api sandbox-runner
-SANDBOX_EXECUTOR=docker          # in infra/.env
+```
+
+In `infra/.env`, for the IP-only acceptance run:
+
+```ini
+SANDBOX_EXECUTOR=docker
 AIDEV_SANDBOX_MODEL_SERVER_HOST=<your-ollama-or-vllm-host>
+AIDEV_SANDBOX_PREVIEW_MODE=port
+AIDEV_SANDBOX_PREVIEW_HOST=<ubuntu-vps-ip>
+AIDEV_SANDBOX_PREVIEW_PORT_RANGE_START=31000
+AIDEV_SANDBOX_PREVIEW_PORT_RANGE_END=31999
+```
+
+For the future domain-based production mode instead:
+
+```ini
+AIDEV_SANDBOX_PREVIEW_MODE=traefik
 AIDEV_SANDBOX_PREVIEW_DOMAIN=<your-preview-domain>
 ```
 
@@ -319,10 +380,50 @@ docker exec "$CID" curl --connect-timeout 3 -sS -o /dev/null -w '%{http_code}\n'
 #  expect:  000   (connect timeout, no route)
 ```
 
-### 4. Traefik preview registration is live in <1s
+### 4. Preview registration is live in <1s
+
+Run the variant that matches `AIDEV_SANDBOX_PREVIEW_MODE`.
+
+#### 4a. `port` mode (IP-only acceptance)
 
 Trigger `start_preview_server()` (the agent-runner does this when
 `frontend_qa` passes). Then:
+
+```sh
+# Confirm the host published the allocated port (3000 -> 31xxx mapping)
+docker port "$CID"
+#  expect:  3000/tcp -> 0.0.0.0:31000   (or whichever host port was allocated)
+
+# Read the public URL from the sandbox.preview.registered event
+docker exec aidev-redis redis-cli LRANGE aidev:task:<task-id>:events 0 -1 \
+    | grep preview.registered
+#  expect:  ..."mode":"port"... "public_url":"http://<vps-ip>:31000"...
+
+# Reach it from your laptop
+curl -sS -o /dev/null -w '%{http_code}\n' http://<ubuntu-vps-ip>:31000
+#  expect:  200   (frontend dev server reachable)
+```
+
+Cancel / approve / fail the task → confirm:
+
+```sh
+docker ps -f label=aidev.sandbox=true -f task=<task-id>
+#  expect:  empty
+
+curl --connect-timeout 3 -sS -o /dev/null -w '%{http_code}\n' http://<ubuntu-vps-ip>:31000
+#  expect:  000   (connection refused / no listener)
+```
+
+Then start a new task and confirm the registrar **recycles** the port:
+
+```sh
+docker port "$NEW_CID"
+#  expect:  3000/tcp -> 0.0.0.0:31000   (same slot reused)
+```
+
+#### 4b. `traefik` mode (future domain-based production)
+
+Trigger `start_preview_server()`. Then:
 
 ```sh
 ls -la infra/traefik/dynamic/tasks/
@@ -351,7 +452,7 @@ Trigger all four termination paths in separate tasks:
 
 | Path                    | Expected after exit                                                                                    |
 | ----------------------- | ------------------------------------------------------------------------------------------------------ |
-| `DONE` (happy path)     | `docker ps -a -f label=aidev.sandbox=true -f task=<id>` → empty; `docker volume ls -f name=<id>` empty; `docker network ls -f name=<id>` empty; preview YAML gone |
+| `DONE` (happy path)     | `docker ps -a -f label=aidev.sandbox=true -f task=<id>` → empty; `docker volume ls -f name=<id>` empty; `docker network ls -f name=<id>` empty; `port` mode: allocated host port no longer in `docker port` output; `traefik` mode: preview YAML gone |
 | `REJECTED` after FE QA  | Same as above                                                                                          |
 | `CANCELLED` mid-run     | Same as above                                                                                          |
 | `FAILED` (uncaught exc) | Same as above. The executor `__aexit__` runs cleanup in a `finally`; one failed cleanup step must not skip the others |

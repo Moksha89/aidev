@@ -1,10 +1,18 @@
-"""Per-task preview routing through Traefik's file provider.
+"""Per-task preview routing.
 
-When a sandbox brings up the frontend dev server we register a router
-in Traefik so reviewers can hit it at
-`task-<id>.preview.<DOMAIN>`. Traefik watches
-`infra/traefik/dynamic/tasks/` and picks new files up automatically —
-no reload required.
+Two registrars are shipped:
+
+* ``PortPreviewRegistrar`` — IP-only acceptance mode (default). Picks a
+  host port from a configured range, exposes the sandbox dev server on
+  it, and advertises ``http://<public-host>:<port>``. No DNS / TLS /
+  reverse proxy required, which is what the Ubuntu VPS acceptance run
+  uses.
+* ``PreviewRegistrar`` (alias ``TraefikPreviewRegistrar``) — domain-based
+  mode, retained as a future-production path. Writes a Traefik dynamic
+  file to ``infra/traefik/dynamic/tasks/`` so reviewers can hit
+  ``task-<id>.preview.<DOMAIN>`` once DNS + certs are configured.
+
+The docker executor picks one based on ``SandboxConfig.preview_mode``.
 """
 
 from __future__ import annotations
@@ -12,6 +20,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import threading
 from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
@@ -116,8 +125,152 @@ class PreviewRegistrar:
         return True
 
 
+# Alias kept for clarity at call sites that select an explicit mode.
+TraefikPreviewRegistrar = PreviewRegistrar
+
+
+@dataclass(frozen=True)
+class PortAllocation:
+    """One port-based preview slot returned by ``PortPreviewRegistrar``.
+
+    Carries every value the executor needs to wire a host -> container
+    port mapping and to advertise the public URL back to the dashboard.
+    """
+
+    task_id: str
+    host_port: int
+    internal_port: int
+    public_host: str
+
+    @property
+    def public_url(self) -> str:
+        return f"http://{self.public_host}:{self.host_port}"
+
+    @property
+    def port_bindings(self) -> dict[str, int]:
+        """Shaped for ``docker.containers.create(ports=...)``."""
+
+        return {f"{self.internal_port}/tcp": self.host_port}
+
+
+class PortPoolExhaustedError(RuntimeError):
+    """Raised when no free host port is left in the configured range."""
+
+
+class PortPreviewRegistrar:
+    """Allocate host ports for IP-only preview URLs.
+
+    The registrar is in-memory and process-local — one sandbox-runner
+    owns the pool. It is safe across asyncio tasks because all mutation
+    sits behind a ``threading.Lock`` and the methods themselves are
+    synchronous (the executor calls them from ``asyncio.to_thread``).
+
+    Re-allocating for the same ``task_id`` returns the previously
+    reserved port — idempotent on the same key so the executor can call
+    ``allocate`` multiple times during one session if needed.
+    """
+
+    def __init__(
+        self,
+        *,
+        public_host: str,
+        port_range_start: int,
+        port_range_end: int,
+    ) -> None:
+        if port_range_start <= 0 or port_range_end <= 0:
+            raise ValueError("preview port range must be positive")
+        if port_range_end < port_range_start:
+            raise ValueError(
+                "preview_port_range_end must be >= preview_port_range_start; "
+                f"got {port_range_start}..{port_range_end}"
+            )
+        self._public_host = public_host
+        self._start = port_range_start
+        self._end = port_range_end
+        self._allocations: dict[str, int] = {}
+        self._reverse: dict[int, str] = {}
+        self._lock = threading.Lock()
+
+    @property
+    def public_host(self) -> str:
+        return self._public_host
+
+    @property
+    def port_range(self) -> tuple[int, int]:
+        return (self._start, self._end)
+
+    def allocate(
+        self,
+        *,
+        task_id: str,
+        internal_port: int,
+    ) -> PortAllocation:
+        if not _TASK_ID_RE.match(task_id):
+            raise ValueError(
+                f"task_id must match [A-Za-z0-9_-]+, got {task_id!r}"
+            )
+        with self._lock:
+            existing = self._allocations.get(task_id)
+            if existing is not None:
+                return PortAllocation(
+                    task_id=task_id,
+                    host_port=existing,
+                    internal_port=internal_port,
+                    public_host=self._public_host,
+                )
+            for candidate in range(self._start, self._end + 1):
+                if candidate not in self._reverse:
+                    self._allocations[task_id] = candidate
+                    self._reverse[candidate] = task_id
+                    logger.info(
+                        "preview.allocate task_id=%s port=%s host=%s",
+                        task_id,
+                        candidate,
+                        self._public_host,
+                    )
+                    return PortAllocation(
+                        task_id=task_id,
+                        host_port=candidate,
+                        internal_port=internal_port,
+                        public_host=self._public_host,
+                    )
+        raise PortPoolExhaustedError(
+            f"no free preview port in {self._start}-{self._end}"
+        )
+
+    def release(self, task_id: str) -> bool:
+        """Free a previously allocated port.
+
+        Returns True if a port was released, False if nothing was held.
+        """
+
+        with self._lock:
+            port = self._allocations.pop(task_id, None)
+            if port is None:
+                return False
+            self._reverse.pop(port, None)
+        logger.info("preview.release task_id=%s port=%s", task_id, port)
+        return True
+
+    def allocation_for(self, task_id: str) -> PortAllocation | None:
+        with self._lock:
+            port = self._allocations.get(task_id)
+        if port is None:
+            return None
+        return PortAllocation(
+            task_id=task_id,
+            host_port=port,
+            internal_port=0,  # not known at this layer
+            public_host=self._public_host,
+        )
+
+
 __all__ = [
+    "PortAllocation",
+    "PortPoolExhaustedError",
+    "PortPreviewRegistrar",
     "PreviewRegistrar",
     "PreviewRoute",
+    "TraefikPreviewRegistrar",
     "render_dynamic_config",
 ]

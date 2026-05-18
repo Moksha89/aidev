@@ -56,6 +56,12 @@ services:
       AIDEV_ADMIN_EMAIL: ${AIDEV_ADMIN_EMAIL:-admin@example.com}
       AIDEV_ADMIN_PASSWORD: ${AIDEV_ADMIN_PASSWORD:?required}
       AIDEV_CORS_ORIGINS: ${AIDEV_CORS_ORIGINS:-http://localhost:3000}
+    # IP-only acceptance: publish the API on the host so it's reachable
+    # at http://<vps-ip>:8000. The Traefik labels below are inert in
+    # IP-only mode (the `traefik` service is profile-gated) and only
+    # activate when you opt into the domain-based production mode.
+    ports:
+      - "${AIDEV_API_BIND:-0.0.0.0}:8000:8000"
     labels:
       - traefik.enable=true
       - traefik.http.routers.aidev-api.rule=Host(`api.${AIDEV_DOMAIN:-aidev.local}`)
@@ -73,8 +79,14 @@ services:
     depends_on:
       - api
     environment:
-      NEXT_PUBLIC_API_BASE_URL: https://api.${AIDEV_DOMAIN:-aidev.local}
+      # In IP-only mode this is the API URL the browser uses, e.g.
+      # http://<ubuntu-vps-ip>:8000. Override in infra/.env.
+      NEXT_PUBLIC_API_BASE_URL: ${NEXT_PUBLIC_API_BASE_URL:-http://localhost:8000}
       NEXT_PUBLIC_APP_NAME: ${NEXT_PUBLIC_APP_NAME:-AI Developer}
+    # IP-only acceptance: publish the dashboard on the host so it's
+    # reachable at http://<vps-ip>:3000.
+    ports:
+      - "${AIDEV_WEB_BIND:-0.0.0.0}:3000:3000"
     labels:
       - traefik.enable=true
       - traefik.http.routers.aidev-web.rule=Host(`${AIDEV_DOMAIN:-aidev.local}`)
@@ -124,8 +136,15 @@ services:
       AIDEV_SANDBOX_EGRESS_PROXY_URL: http://aidev-egress-proxy:8888
       AIDEV_SANDBOX_EGRESS_PROXY_ALIAS: aidev-egress-proxy
       AIDEV_SANDBOX_MODEL_SERVER_HOST: ${AIDEV_SANDBOX_MODEL_SERVER_HOST:-}
+      # Preview registration mode: `port` (IP-only acceptance, default)
+      # or `traefik` (domain-based production).
+      AIDEV_SANDBOX_PREVIEW_MODE: ${AIDEV_SANDBOX_PREVIEW_MODE:-port}
+      AIDEV_SANDBOX_PREVIEW_HOST: ${AIDEV_SANDBOX_PREVIEW_HOST:-127.0.0.1}
+      AIDEV_SANDBOX_PREVIEW_PORT_RANGE_START: ${AIDEV_SANDBOX_PREVIEW_PORT_RANGE_START:-31000}
+      AIDEV_SANDBOX_PREVIEW_PORT_RANGE_END: ${AIDEV_SANDBOX_PREVIEW_PORT_RANGE_END:-31999}
+      AIDEV_SANDBOX_PREVIEW_PORT: ${AIDEV_SANDBOX_PREVIEW_PORT:-3000}
       AIDEV_SANDBOX_TRAEFIK_DYNAMIC_DIR: /etc/traefik/dynamic/tasks
-      AIDEV_SANDBOX_PREVIEW_DOMAIN: ${AIDEV_SANDBOX_PREVIEW_DOMAIN:-preview.${AIDEV_DOMAIN:-aidev.local}}
+      AIDEV_SANDBOX_PREVIEW_DOMAIN: ${AIDEV_SANDBOX_PREVIEW_DOMAIN:-preview.aidev.local}
       AIDEV_SANDBOX_EVENT_CHANNEL: aidev.sandbox.events
     volumes:
       # The worker drives the host's Docker daemon to launch one
@@ -155,9 +174,15 @@ services:
       timeout: 3s
       retries: 5
 
+  # Traefik is only required for the future domain-based production
+  # mode. Start it explicitly with:
+  #   docker compose --profile traefik up -d traefik
+  # In IP-only acceptance mode leave it stopped and reach services
+  # directly on host ports 3000 / 8000.
   traefik:
     image: traefik:v3.1
     restart: unless-stopped
+    profiles: ["traefik"]
     command:
       - --providers.docker=true
       - --providers.docker.exposedbydefault=false
