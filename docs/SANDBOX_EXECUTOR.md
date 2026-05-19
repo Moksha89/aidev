@@ -139,7 +139,7 @@ infra-sandbox-runner-1    DOCKER_HOST=tcp://docker-socket-proxy:2375
             │
             ▼
     docker-socket-proxy     image: tecnativa/docker-socket-proxy:0.2.0
-            │               read_only: true, cap_drop: ALL, no host port
+            │               cap_drop: ALL, no-new-privileges, no host port
             │ (/var/run/docker.sock:ro — proxy only)
             ▼
         /var/run/docker.sock on the VPS
@@ -159,7 +159,7 @@ Compose contract (`infra/docker-compose.yml`):
   executor code changes were needed.
 * `docker-socket-proxy` exposes port `2375` **on the compose
   network only** (no `ports:` entry, no host publishing).
-* The proxy runs `read_only: true`, `cap_drop: [ALL]`,
+* The proxy runs `cap_drop: [ALL]`,
   `security_opt: [no-new-privileges:true]`, and binds the host
   socket **read-only**. It is the only container in the stack with
   visibility of `/var/run/docker.sock`.

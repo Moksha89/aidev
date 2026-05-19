@@ -143,10 +143,16 @@ sandbox-runner ──▶ tcp://docker-socket-proxy:2375 ──▶ /var/run/docke
 * The worker connects via `DOCKER_HOST=tcp://docker-socket-proxy:2375`
   on the compose network. The proxy port is not published on the host.
 * The proxy itself runs the `tecnativa/docker-socket-proxy:0.2.0`
-  image with `read_only: true`, `cap_drop: [ALL]`,
+  image with `cap_drop: [ALL]`,
   `security_opt: [no-new-privileges:true]`, and the host socket
   mounted **read-only**. It is the only container in the stack that
-  can see `/var/run/docker.sock`.
+  can see `/var/run/docker.sock`. (We deliberately do NOT set
+  `read_only: true` on the rootfs: the image's entrypoint regenerates
+  `/usr/local/etc/haproxy/haproxy.cfg` from env on every start, which
+  read-only-root breaks. The remaining hardening still applies — no
+  added caps, no privilege escalation, no host port, no writable host
+  paths — so the writable rootfs only exposes the proxy's own
+  ephemeral layer.)
 * Allowed Engine API surfaces (CONTAINERS, NETWORKS, VOLUMES, EXEC,
   IMAGES, plus PING and VERSION for the SDK handshake) cover exactly
   what `DockerSandboxExecutor` actually calls.

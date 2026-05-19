@@ -171,14 +171,18 @@ services:
     # `docker-socket-proxy:2375`.
     expose:
       - "2375"
-    read_only: true
-    # The image's entrypoint regenerates /usr/local/etc/haproxy/haproxy.cfg
-    # from the env vars on every start, so that directory must be writable.
-    # Everything else stays read-only.
+    # NOTE: we intentionally do NOT set `read_only: true` here.
+    # tecnativa/docker-socket-proxy:0.2.0 reads
+    # `/usr/local/etc/haproxy/haproxy.cfg.template` from the image and
+    # re-writes `haproxy.cfg` next to it on every start. read-only-root
+    # makes the rewrite fail and the container CrashLoops; tmpfs'ing the
+    # haproxy dir hides the template. The container has `cap_drop: ALL`,
+    # `no-new-privileges`, no host port, and the docker socket is mounted
+    # read-only, so the writable rootfs only exposes the proxy's own
+    # ephemeral layer — not the host.
     tmpfs:
       - /run
       - /tmp
-      - /usr/local/etc/haproxy
     cap_drop:
       - ALL
     security_opt:
