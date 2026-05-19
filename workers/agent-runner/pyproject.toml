@@ -13,10 +13,12 @@ sqlalchemy = "^2.0"
 psycopg = { extras = ["binary"], version = "^3.2" }
 pydantic-settings = "^2.4"
 httpx = "^0.27"
+docker = "^7.1"
 aidev-shared = { path = "../../packages/shared/python", develop = true }
 aidev-rules-engine = { path = "../../packages/rules-engine", develop = true }
 aidev-github-client = { path = "../../packages/github-client", develop = true }
 aidev-model-client = { path = "../../packages/model-client", develop = true }
+aidev-sandbox-runner = { path = "../sandbox-runner", develop = true }
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^8.0"

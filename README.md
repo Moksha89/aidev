@@ -128,6 +128,20 @@ Each agent is a separate prompt + tool set; transitions are gated by the
 rules engine and (for the human gate) the dashboard's "Approve frontend"
 button.
 
+There are **two pipeline implementations** that share this lifecycle:
+
+- **Mock pipeline** (default) — runs in-process inside the API, seeds
+  demo data, never spawns a sandbox, never calls a model, never opens
+  a real PR. This is what the dashboard has been driving since v0.1.
+- **Real pipeline (v0.4)** — Celery → `agent-runner` → `sandbox-runner`
+  → per-task Docker container. Clones the connected repo, calls the
+  local model, captures a real diff, opens a real PR on approval.
+
+The real pipeline is opt-in **only** — both `AIDEV_AGENT_PIPELINE=real`
+and `SANDBOX_EXECUTOR=docker` must be set, and the task must be
+attached to an explicit repository row. Anything short of that falls
+back to mock. See [`docs/AGENT_PIPELINE.md`](./docs/AGENT_PIPELINE.md).
+
 ## Contributing
 
 This is an early-stage scaffold. See `docs/ROADMAP.md` for the things that

@@ -33,6 +33,7 @@ from app.schemas import (
     TaskLogRead,
     TaskRead,
 )
+from app.services import dispatcher
 
 router = APIRouter(prefix="/tasks", tags=["tasks"])
 
@@ -125,7 +126,7 @@ def start_task(
             status_code=status.HTTP_409_CONFLICT,
             detail=f"Task is in phase '{task.phase}', not 'pending'",
         )
-    orchestrator.start_task(db, task)
+    dispatcher.dispatch_start(db, task)
     db.commit()
     db.refresh(task)
     return TaskRead.model_validate(task)
@@ -173,7 +174,7 @@ def approve_frontend(
         actor_user_agent=request.headers.get("user-agent"),
     )
     db.add(approval)
-    orchestrator.approve_frontend(db, task)
+    dispatcher.dispatch_approve_frontend(db, task)
     db.commit()
     db.refresh(approval)
     return ApprovalRead.model_validate(approval)

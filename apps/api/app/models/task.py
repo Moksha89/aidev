@@ -25,6 +25,14 @@ class Task(UuidPkMixin, TimestampMixin, Base):
     instruction: Mapped[str] = mapped_column(Text, nullable=False)
     phase: Mapped[str] = mapped_column(String(32), default="pending", nullable=False)
     active_agent: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # v0.4: ``mock`` (in-process orchestrator, demo data) or ``real``
+    # (Celery agent-runner pipeline, real sandbox, real PR). Set when
+    # the task starts; the approve-frontend route uses it to decide
+    # whether to enqueue the resume Celery job or run the mock
+    # post-approval steps.
+    execution_mode: Mapped[str] = mapped_column(
+        String(16), default="mock", nullable=False
+    )
     branch_name: Mapped[str | None] = mapped_column(String(256), nullable=True)
     preview_url: Mapped[str | None] = mapped_column(String(512), nullable=True)
     pr_url: Mapped[str | None] = mapped_column(String(512), nullable=True)
