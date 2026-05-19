@@ -6,7 +6,11 @@ import os
 
 from celery import Celery
 
-_BROKER_URL = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
+_BROKER_URL = (
+    os.environ.get("AIDEV_REDIS_URL")
+    or os.environ.get("REDIS_URL")
+    or "redis://localhost:6379/0"
+)
 _BACKEND_URL = os.environ.get("CELERY_RESULT_BACKEND", _BROKER_URL)
 
 celery_app = Celery(

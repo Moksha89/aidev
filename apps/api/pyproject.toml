@@ -17,6 +17,11 @@ pydantic = { extras = ["email"], version = "^2.7" }
 pydantic-settings = "^2.4"
 python-jose = { extras = ["cryptography"], version = "^3.3" }
 passlib = { extras = ["bcrypt"], version = "^1.7" }
+# passlib 1.7.4 reads `bcrypt.__about__.__version__` at import time; that
+# attribute was removed in bcrypt 4.1, so the CryptContext fails to initialise
+# on bcrypt >= 4.1 (login then returns 401 for every password). Pin until we
+# either upgrade to passlib 1.7.5+ or migrate to argon2.
+bcrypt = ">=4.0,<4.1"
 celery = { extras = ["redis"], version = "^5.4" }
 httpx = "^0.27"
 python-multipart = "^0.0.9"

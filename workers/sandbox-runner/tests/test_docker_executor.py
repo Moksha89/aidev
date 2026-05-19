@@ -94,12 +94,37 @@ class _FakeNetwork:
         self.name = name
         self.id = f"net-{name}"
         self.removed = False
+        self.remove_failures = 0  # if >0 the next N remove() calls raise
         self.connections: list[tuple[Any, list[str]]] = []
+        self.disconnects: list[Any] = []
+        self.attrs: dict[str, Any] = {"Containers": {}}
 
     def connect(self, container: Any, aliases: list[str] | None = None) -> None:
+        cid = getattr(container, "id", str(id(container)))
         self.connections.append((container, list(aliases or [])))
+        self.attrs.setdefault("Containers", {})[cid] = {
+            "Name": getattr(container, "name", cid),
+        }
+
+    def disconnect(self, container: Any, *, force: bool = False) -> None:
+        cid = container if isinstance(container, str) else getattr(
+            container, "id", str(container)
+        )
+        self.disconnects.append(cid)
+        if isinstance(self.attrs.get("Containers"), dict):
+            self.attrs["Containers"].pop(cid, None)
+
+    def reload(self) -> None:
+        # Fake daemon round-trip; in real Docker, this re-fetches attrs.
+        return None
 
     def remove(self) -> None:
+        if self.remove_failures > 0:
+            self.remove_failures -= 1
+            raise RuntimeError(
+                f"network has active endpoints (fake remove_failures left "
+                f"{self.remove_failures})"
+            )
         self.removed = True
 
 
@@ -122,12 +147,18 @@ class _FakeNetworks:
         return [n for n in self.created if n.name in set(names)]
 
     def create(
-        self, *, name: str, driver: str = "bridge", internal: bool = False
+        self,
+        *,
+        name: str,
+        driver: str = "bridge",
+        internal: bool = False,
+        options: dict[str, str] | None = None,
     ) -> _FakeNetwork:
-        # Capture the kwargs so tests can assert internal=True.
+        # Capture the kwargs so tests can assert hardening flags.
         net = _FakeNetwork(name)
         net.driver = driver  # type: ignore[attr-defined]
         net.internal = internal  # type: ignore[attr-defined]
+        net.options = dict(options or {})  # type: ignore[attr-defined]
         self.created.append(net)
         return net
 
@@ -296,15 +327,25 @@ async def test_session_applies_full_safety_profile(
     # Hardening flags
     assert "no-new-privileges:true" in kwargs["security_opt"]
     assert kwargs["cap_drop"] == ["ALL"]
+    # Re-added caps are the *minimum* needed to make the fs-protection
+    # chmod script work; nothing network/admin/setuid related.
+    assert kwargs["cap_add"] == ["CHOWN", "FOWNER"]
     # Per-task volume mounted at /workspace
     assert kwargs["volumes"]["aidev-sandbox-vol-t1"] == {
         "bind": "/workspace",
         "mode": "rw",
     }
-    # Per-task internal network
+    # Per-task sandbox bridge. We had to drop both `internal=True` and
+    # the `enable_ip_masquerade=false` override (see _create_network
+    # docstring for the history). The network is now a plain bridge so
+    # published ports work AND the multi-homed egress proxy keeps its
+    # default gateway on `infra_default`. Egress is enforced by the
+    # HTTP_PROXY env vars + tinyproxy allowlist (cooperative). A
+    # kernel-level bypass block is tracked as a follow-up.
     network = fake_client.networks.created[0]
     assert kwargs["network"] == network.name
-    assert network.internal is True
+    assert network.internal is False
+    assert network.options == {}
     # Egress proxy env injected
     assert kwargs["environment"]["HTTP_PROXY"] == "http://aidev-egress-proxy:8888"
     assert kwargs["environment"]["HTTPS_PROXY"] == "http://aidev-egress-proxy:8888"
@@ -528,3 +569,31 @@ async def test_egress_proxy_attached_when_configured(
         for c, _ in network.connections
     )
     assert proxy_attached
+
+
+@pytest.mark.asyncio
+async def test_session_disconnects_endpoints_before_network_remove(
+    executor: DockerSandboxExecutor, fake_client: _FakeDocker
+) -> None:
+    """Regression: real Docker refuses to remove a network with active
+    endpoints. The cleanup path must disconnect every attached container
+    (the egress proxy is the typical lingerer) before calling remove().
+    """
+
+    # Pre-register the proxy container so the executor attaches it.
+    fake_client.containers.create(
+        name="aidev-egress-proxy",
+        command=["true"],
+    )
+    async with executor.session(task_id="t-net-cleanup"):
+        pass
+
+    network = fake_client.networks.created[0]
+    # The proxy is the typical lingerer; we assert at least one
+    # disconnect call happened before the network was removed so the
+    # real `network has active endpoints` daemon error is avoided.
+    assert network.disconnects, (
+        f"expected disconnect() to be called before remove(); "
+        f"got disconnects={network.disconnects!r}"
+    )
+    assert network.removed, "network.remove() must succeed after disconnect"

@@ -11,7 +11,11 @@ import os
 
 from celery import Celery
 
-_BROKER_URL = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
+_BROKER_URL = (
+    os.environ.get("AIDEV_REDIS_URL")
+    or os.environ.get("REDIS_URL")
+    or "redis://localhost:6379/0"
+)
 
 celery_app = Celery(
     "aidev_sandbox_runner",

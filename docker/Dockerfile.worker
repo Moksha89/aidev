@@ -50,4 +50,8 @@ USER 10001
 # Worker name must match the Celery app's module path.
 # - agent-runner   -> agent_runner.worker
 # - sandbox-runner -> sandbox_runner.worker
-CMD ["sh", "-c", "celery -A ${WORKER_NAME//-/_}.worker worker --loglevel=INFO --concurrency=2"]
+#
+# The default shell in python:3.11-slim-bookworm is `dash`, which does
+# not support bash's `${var//x/y}` parameter expansion, so we use POSIX
+# `tr` + a command substitution instead.
+CMD ["sh", "-c", "celery -A $(echo \"$WORKER_NAME\" | tr - _).worker worker --loglevel=INFO --concurrency=2"]

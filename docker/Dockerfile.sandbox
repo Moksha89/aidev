@@ -30,9 +30,14 @@ USER agent
 WORKDIR /workspace
 
 # Install Playwright + browsers as the unprivileged user so its cache
-# lives under $HOME, not /root.
-RUN python3 -m pip install --user --no-cache-dir playwright \
-    && python3 -m playwright install --with-deps chromium
+# lives under $HOME, not /root. Bookworm's system Python is marked
+# externally-managed (PEP 668), so --break-system-packages is required
+# to allow a per-user pip install inside this ephemeral image. The
+# system-level Chromium deps were already installed up top via apt-get,
+# so `playwright install` does not need `--with-deps` here (which would
+# also fail because the unprivileged user cannot run apt-get).
+RUN python3 -m pip install --user --no-cache-dir --break-system-packages playwright \
+    && python3 -m playwright install chromium
 
 # `docker run` should pass --read-only and tmpfs /tmp; the entrypoint
 # script in `sandbox-runner` will mount the per-task volume at /workspace.

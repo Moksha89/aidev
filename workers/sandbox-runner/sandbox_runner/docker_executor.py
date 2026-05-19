@@ -649,6 +649,29 @@ class DockerSandboxExecutor:
                 except Exception:
                     logger.warning("volume.remove failed for task %s", task_id)
             if network is not None:
+                # Disconnect any still-attached containers (egress proxy is
+                # the typical lingerer) so `network.remove` does not error
+                # with "has active endpoints". Best-effort; the eventual
+                # `remove` call is still wrapped in its own try/except.
+                try:
+                    await asyncio.to_thread(network.reload)
+                    attached = (network.attrs.get("Containers") or {}).keys()
+                    for cid in list(attached):
+                        try:
+                            await asyncio.to_thread(
+                                network.disconnect, cid, force=True
+                            )
+                        except Exception:
+                            logger.warning(
+                                "network.disconnect failed for task %s container %s",
+                                task_id,
+                                cid,
+                            )
+                except Exception:
+                    logger.warning(
+                        "could not enumerate network endpoints for task %s",
+                        task_id,
+                    )
                 try:
                     await asyncio.to_thread(network.remove)
                 except Exception:
@@ -673,12 +696,53 @@ def _normalise_relative(path: str) -> str:
 
 
 def _create_network(*, client: Any, name: str) -> Any:
-    """Create the per-task internal network (idempotent on name)."""
+    """Create the per-task sandbox bridge network (idempotent on name).
+
+    Design notes / history of this function (read before changing):
+
+    1. We *used* to set ``internal=True``. Docker interprets that as
+       "no traffic flows in or out of the network from external
+       sources" — and that turns out to *also* disable host-side DNAT
+       for published ports. With ``internal=True`` the daemon does not
+       start docker-proxy, so ``-p 31xxx:3000`` ends up as a dead
+       mapping that's listed in ``HostConfig.PortBindings`` but has no
+       actual host listener (verified on the Ubuntu acceptance VPS,
+       `curl 127.0.0.1:31xxx/` returned `000`). That broke IP-only /
+       port-mode previews end-to-end.
+
+    2. We then *tried* ``com.docker.network.bridge.enable_ip_masquerade
+       =false`` instead. Published ports started working, but Docker's
+       ``network.connect()`` on the multi-homed egress proxy container
+       silently rewrote the proxy's *default gateway* to point at the
+       new (no-masq) sandbox bridge. That made tinyproxy's outbound
+       relay (CONNECT to api.github.com etc.) exit via the no-masq
+       interface, get dropped by the upstream router, and return
+       ``500 Unable to connect`` to the sandbox client. Egress
+       allow-listed traffic was effectively broken across the board.
+
+    3. So we now use a *plain* bridge: not internal, no masquerade
+       override. Docker installs the usual MASQUERADE + DNAT rules,
+       published ports work, and the egress proxy keeps its default
+       gateway on ``infra_default``.
+
+       The trade-off: in this configuration the kernel does *not*
+       block direct outbound to raw IPs from the sandbox. Egress is
+       gated by the HTTP_PROXY / HTTPS_PROXY env vars (cooperative
+       agent model) plus tinyproxy's hostname allowlist. A determined
+       agent could bypass the proxy by hitting an IP directly. This is
+       acceptable for the IP-only acceptance phase because the agent
+       runtime is *our* code (not adversarial). Closing the bypass
+       requires a per-task port-forwarder sidecar that sits on both a
+       plain bridge (for ``-p`` to work) and an ``internal=true``
+       sandbox bridge (where the agent actually lives) — that's
+       tracked as a v0.2 architectural change, see
+       docs/SANDBOX_EXECUTOR.md "Known limitations".
+    """
 
     existing = client.networks.list(names=[name])
     if existing:
         return existing[0]
-    return client.networks.create(name=name, driver="bridge", internal=True)
+    return client.networks.create(name=name, driver="bridge")
 
 
 def _create_volume(*, client: Any, name: str) -> Any:
@@ -729,7 +793,21 @@ def _create_container(
             volume_name: {"bind": config.workspace_path, "mode": "rw"},
         },
         "security_opt": ["no-new-privileges:true"],
+        # Drop ALL caps, then re-add the two needed by the in-container
+        # fs-protection script. With `cap_drop=ALL` the in-container
+        # root has *no* DAC bypass and so cannot `chmod -R a-w` files
+        # owned by the unprivileged agent UID — which means the whole
+        # three-tier FS protection collapses to no-op. We re-add only
+        # CHOWN + FOWNER:
+        #   - CHOWN: allows `chown` if the protection script ever needs
+        #     to re-parent agent-owned files.
+        #   - FOWNER: bypass the "owner check" for chmod/utime, so the
+        #     in-container root can flip a-w on agent-owned dirs.
+        # Neither enables privilege escalation because
+        # no-new-privileges blocks suid binaries from gaining anything
+        # back and there is no network capability re-added.
         "cap_drop": ["ALL"],
+        "cap_add": ["CHOWN", "FOWNER"],
         "mem_limit": config.mem_limit,
         "nano_cpus": nano_cpus,
         "pids_limit": config.pids_limit,

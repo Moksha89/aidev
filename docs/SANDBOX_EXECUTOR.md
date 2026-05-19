@@ -24,10 +24,11 @@ Select via `SANDBOX_EXECUTOR=docker` (defaults to `mock`). See
 2. **Frontend-first enforced at three layers**: prompt, rules engine,
    filesystem. The agent cannot accidentally write a backend file
    pre-approval *even if* layers 1 and 2 are bypassed by a future bug.
-3. **Strict allowlist egress.** Sandboxes run on a per-task
-   `internal: true` Docker network; the only path out is the
+3. **Allowlist egress.** Every sandbox container has
+   `HTTP_PROXY` / `HTTPS_PROXY` pointed at the per-task-attached
    `aidev-egress-proxy` (tinyproxy) sidecar, which deny-by-defaults
-   anything not on the allowlist.
+   anything not on the allowlist. Currently *cooperative* — see
+   "Known limitations" below for the kernel-level follow-up.
 4. **Cleanup is not optional.** Container, volume, network, and preview
    registration (port allocation in IP-only mode, or Traefik dynamic
    file in domain mode) are all removed in a `finally` block; if any
@@ -49,7 +50,7 @@ cap_drop        ALL                          # drop every Linux capability
 mem_limit       4g                           # AIDEV_SANDBOX_MEM_LIMIT
 nano_cpus       2e9                          # AIDEV_SANDBOX_CPUS (2 CPUs)
 pids_limit      512                          # AIDEV_SANDBOX_PIDS_LIMIT
-network         aidev_sandbox_<task_id>      # internal=true, no default gw
+network         aidev_sandbox_<task_id>      # per-task bridge; egress proxy attached
 volumes         aidev-sandbox-vol-<task_id>:/workspace   # only mount
 ```
 
@@ -94,12 +95,13 @@ both together.
 
 ## Network egress allowlist
 
-The sandbox network is `internal: true`, so by default it has no route
-to the internet. The executor wires in a single egress path:
+Every sandbox container has `HTTP_PROXY` / `HTTPS_PROXY` env vars
+pointed at the `aidev-egress-proxy` (tinyproxy) sidecar attached to
+its per-task bridge:
 
 ```
         sandbox container                   egress-proxy
-       (per-task network)                  (tinyproxy sidecar)
+       (per-task bridge)                   (tinyproxy sidecar)
               │                                   │
               │  HTTP(S)_PROXY=http://aidev-      │  filters by anchored
               │     egress-proxy:8888 ────────────▶  regex allowlist;
@@ -107,6 +109,13 @@ to the internet. The executor wires in a single egress path:
               │                                   ▼
                                               upstream internet
 ```
+
+The proxy enforces a hostname allowlist (anchored regex,
+deny-by-default). Any HTTP / HTTPS client that honours `HTTP_PROXY`
+(curl, wget, pip, npm, pnpm, go, cargo, requests, urllib, axios, fetch
+via Node, …) goes through tinyproxy and is filtered. Direct outbound
+to raw IPs from the sandbox is *not* blocked at the kernel layer —
+see "Known limitations" below.
 
 Default allowlist (`sandbox_runner.egress.DEFAULT_ALLOWLIST`):
 
@@ -373,12 +382,16 @@ docker exec "$CID" env HTTPS_PROXY=http://aidev-egress-proxy:8888 \
 #  expect:  403
 ```
 
-Bypass test — sandbox has no default route, so without the proxy:
+Bypass attempt — currently *informational only* (cooperative egress):
 
 ```sh
-docker exec "$CID" curl --connect-timeout 3 -sS -o /dev/null -w '%{http_code}\n' https://1.1.1.1
-#  expect:  000   (connect timeout, no route)
+docker exec "$CID" sh -c 'unset HTTP_PROXY HTTPS_PROXY; curl --connect-timeout 5 -sS -o /dev/null -w "%{http_code}\n" https://1.1.1.1'
+#  expect today:  any 2xx/3xx  (sandbox CAN currently reach raw IPs)
+#  expected after v0.2 sidecar-forwarder hardening:  000 (no route)
 ```
+
+See "Known limitations" below for why this check is informational and
+how it will become a hard gate.
 
 ### 4. Preview registration is live in <1s
 
@@ -484,6 +497,62 @@ docker exec aidev-redis redis-cli SUBSCRIBE aidev.sandbox.events &
 All seven sections must pass before flipping `SANDBOX_EXECUTOR=docker`
 for production traffic. Keep a dated copy of the run output in
 `docs/runs/` so you can show provenance later.
+
+## Known limitations
+
+These are documented gaps discovered during the Ubuntu host acceptance
+run (see `docs/runs/2026-05-18-ubuntu-acceptance.md`). Each has a
+tracked follow-up before the platform is opened to real project
+traffic.
+
+1. **Cooperative egress, not kernel-level (v0.2 follow-up).**
+   The sandbox network is a *plain* Docker bridge. We originally tried
+   `internal: true` (Docker's "no traffic in or out" mode) but that
+   silently disables host-side DNAT, so `-p 31xxx:3000` published
+   ports become dead mappings. We then tried
+   `com.docker.network.bridge.enable_ip_masquerade=false`, but Docker's
+   `network.connect()` on the multi-homed egress proxy rewrote the
+   proxy's default gateway to the new (no-masq) bridge, breaking
+   tinyproxy's outbound relay across the board.
+
+   The current shape works end-to-end (28/28 acceptance checks pass,
+   including egress allow / deny via the proxy and the host-curl
+   reachability check on the published preview port) but a determined
+   agent could bypass tinyproxy by hitting a raw IP directly. This is
+   acceptable for the IP-only acceptance phase because the agent
+   runtime is *our own code* (not adversarial), and the platform is
+   gated behind operator-CIDR firewall and explicit user approval
+   before serving real project tasks.
+
+   The v0.2 hardening: add a per-task port-forwarder sidecar that
+   sits on both a plain bridge (so `-p` works for the host port
+   mapping) and an `internal: true` sandbox bridge (where the agent
+   actually lives). The sidecar forwards `host:31xxx` → `agent:3000`
+   via socat / nginx-stream. The egress proxy moves entirely off the
+   sandbox bridge; the sandbox container's only route off the
+   internal bridge is through the proxy. That restores the
+   kernel-level outbound block without breaking previews.
+
+2. **In-memory port pool (single sandbox-runner only).** The
+   `PortPreviewRegistrar` is process-local. If the platform ever
+   scales to more than one sandbox-runner instance, ports must move
+   to Redis. Tracked but not urgent — one runner is plenty until
+   real-traffic enablement.
+
+3. **No Playwright recording playback in `port` mode.** Screenshot
+   capture works (the agent runs Playwright inside the sandbox and
+   we exfiltrate the PNGs); but the live-preview tab in the
+   dashboard does not stream video. Not a regression — `traefik`
+   mode behaves the same. Tracked for the dashboard team.
+
+4. **GT 730 + CPU-only model.** Discovered by the deployment GPU
+   probe. The shipped Ubuntu VPS reports `NVIDIA GeForce GT 730` —
+   compute capability 3.5, unsupported by modern CUDA / cuBLAS /
+   llama.cpp. Acceptance runs use the Ollama CPU backend with a
+   small model (`tinyllama` or `phi3:mini`). Real project tasks
+   should switch to a hosted LLM endpoint (added to the egress
+   allowlist via `AIDEV_SANDBOX_MODEL_SERVER_HOST`) until the host
+   gets a usable GPU.
 
 ## Production deployment notes
 
