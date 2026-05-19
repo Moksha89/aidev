@@ -90,6 +90,16 @@ Postgres, Redis and the model server stay on the docker bridge — only
 ports `3000`, `8000`, `8080` (optional) and the preview range
 `31000-31999` are bound on the host.
 
+The v0.3 `docker-socket-proxy` service sits in front of
+`/var/run/docker.sock` on the compose network. It is **not published
+on the host** — port `2375` is only reachable from `sandbox-runner`
+via the compose-internal DNS name `docker-socket-proxy:2375`. The
+proxy itself is the only container that bind-mounts the host docker
+socket (read-only); `sandbox-runner` now talks to Docker exclusively
+through it via `DOCKER_HOST=tcp://docker-socket-proxy:2375`. See
+[`docs/SANDBOX_EXECUTOR.md#v03-docker-socket-gatekeeper`](./SANDBOX_EXECUTOR.md#v03-docker-socket-gatekeeper)
+for the full allow/deny matrix.
+
 ## Step-by-step (Ubuntu GPU host, IP-only acceptance)
 
 ### 1. Base packages
