@@ -112,6 +112,82 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
 
+  # v0.3 Docker socket proxy. The sandbox-runner used to bind-mount
+  # /var/run/docker.sock directly, which meant a bug or compromise in
+  # the worker process = root on the host. We now route every Docker
+  # Engine API call through this proxy, which whitelists only the
+  # endpoints the executor actually needs (containers, networks,
+  # volumes, exec, images, ping, version) and rejects everything else
+  # (swarm/services/tasks/nodes/secrets/configs/plugins/system/build/
+  # commit/distribution/session/auth/events) with 403.
+  #
+  # The proxy itself is the only container that still binds the host
+  # socket, and it binds it read-only. The proxy is a tiny haproxy
+  # config — it does not execute any of the requests itself, only
+  # filters them. See docs/SECURITY.md "Layer 6 — Docker socket
+  # gatekeeper" for the threat model.
+  docker-socket-proxy:
+    container_name: aidev-docker-socket-proxy
+    image: tecnativa/docker-socket-proxy:0.2.0
+    restart: unless-stopped
+    # Permission matrix. 1 = endpoint family is allowed, 0 = blocked
+    # with HTTP 403. POST/DELETE on allowed families also require
+    # POST=1. Everything not listed defaults to 0 in the image.
+    environment:
+      # Required by the Docker SDK on connect.
+      PING: 1
+      VERSION: 1
+      # Endpoint families the executor uses.
+      CONTAINERS: 1
+      NETWORKS: 1
+      VOLUMES: 1
+      EXEC: 1
+      IMAGES: 1
+      # Permit the POST/PUT/DELETE verbs on the allowed families.
+      POST: 1
+      # Explicitly disabled. (Default-deny would already cover them;
+      # listing them keeps the policy obvious to future reviewers.)
+      AUTH: 0
+      BUILD: 0
+      COMMIT: 0
+      CONFIGS: 0
+      DISTRIBUTION: 0
+      EVENTS: 0
+      INFO: 0
+      NODES: 0
+      PLUGINS: 0
+      SECRETS: 0
+      SERVICES: 0
+      SESSION: 0
+      SWARM: 0
+      SYSTEM: 0
+      TASKS: 0
+    # Read-only mount: the proxy only needs to forward Engine API
+    # calls; it never writes to the socket.
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    # Internal-only — never publish 2375 on the host. The
+    # sandbox-runner reaches it on the compose network as
+    # `docker-socket-proxy:2375`.
+    expose:
+      - "2375"
+    read_only: true
+    tmpfs:
+      - /run
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      # `docker version` requires VERSION=1; cleanest liveness check.
+      test:
+        - CMD-SHELL
+        - "wget -qO- http://localhost:2375/_ping >/dev/null 2>&1 || exit 1"
+      interval: 15s
+      timeout: 3s
+      retries: 5
+
   sandbox-runner:
     build:
       context: ..
@@ -123,10 +199,15 @@ services:
       redis: { condition: service_healthy }
       postgres: { condition: service_healthy }
       egress-proxy: { condition: service_started }
+      docker-socket-proxy: { condition: service_started }
     environment:
       AIDEV_DATABASE_URL: postgresql+psycopg://${AIDEV_DB_USER:-aidev}:${AIDEV_DB_PASSWORD}@postgres:5432/${AIDEV_DB_NAME:-aidev}
       AIDEV_REDIS_URL: redis://redis:6379/0
       SANDBOX_EXECUTOR: ${SANDBOX_EXECUTOR:-docker}
+      # v0.3: NO host docker.sock bind. All Engine API calls go
+      # through the docker-socket-proxy service over TCP on the
+      # compose network.
+      DOCKER_HOST: tcp://docker-socket-proxy:2375
       AIDEV_SANDBOX_IMAGE: ${AIDEV_SANDBOX_IMAGE:-aidev/sandbox:latest}
       AIDEV_SANDBOX_CPUS: ${AIDEV_SANDBOX_CPUS:-2}
       AIDEV_SANDBOX_MEM_LIMIT: ${AIDEV_SANDBOX_MEM_LIMIT:-4g}
@@ -147,12 +228,9 @@ services:
       AIDEV_SANDBOX_PREVIEW_DOMAIN: ${AIDEV_SANDBOX_PREVIEW_DOMAIN:-preview.aidev.local}
       AIDEV_SANDBOX_EVENT_CHANNEL: aidev.sandbox.events
     volumes:
-      # The worker drives the host's Docker daemon to launch one
-      # ephemeral container per task. Mounted read-write because we
-      # have to `containers.create()` / `containers.remove()`. The
-      # sandbox containers themselves get NO socket — they cannot
-      # spawn siblings.
-      - /var/run/docker.sock:/var/run/docker.sock
+      # NO direct docker.sock mount. The host socket is mounted only
+      # by docker-socket-proxy (above) which exposes a filtered
+      # subset of the Engine API on tcp://docker-socket-proxy:2375.
       # Shared with the Traefik service so per-task preview routers
       # appear under `/etc/traefik/dynamic/tasks/`.
       - ./traefik/dynamic/tasks:/etc/traefik/dynamic/tasks:rw

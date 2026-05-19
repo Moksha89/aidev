@@ -17,6 +17,8 @@ aidev-rules-engine = { path = "../../packages/rules-engine", develop = true }
 pytest = "^8.0"
 pytest-asyncio = "^0.23"
 ruff = "^0.6"
+# Used by the v0.3 docker-socket-proxy compose-file regression tests.
+pyyaml = "^6.0"
 
 [build-system]
 requires = ["poetry-core>=1.8.0"]

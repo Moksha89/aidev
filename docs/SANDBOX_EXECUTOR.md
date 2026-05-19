@@ -126,6 +126,89 @@ unsetting env or curling a raw IP) and v0.2's "kernel-enforced egress"
 (no route to anywhere except the proxy alias on the internal subnet,
 period).
 
+## v0.3 Docker socket gatekeeper
+
+v0.1 and v0.2 left one trust boundary open: the `sandbox-runner`
+worker had `/var/run/docker.sock` bind-mounted, which means a bug or
+RCE in the worker process could call any Docker Engine API on the
+host. v0.3 closes that boundary by routing every Engine API call
+through a filtering proxy.
+
+```
+infra-sandbox-runner-1    DOCKER_HOST=tcp://docker-socket-proxy:2375
+            │
+            ▼
+    docker-socket-proxy     image: tecnativa/docker-socket-proxy:0.2.0
+            │               read_only: true, cap_drop: ALL, no host port
+            │ (/var/run/docker.sock:ro — proxy only)
+            ▼
+        /var/run/docker.sock on the VPS
+```
+
+Compose contract (`infra/docker-compose.yml`):
+
+* `sandbox-runner` no longer binds `/var/run/docker.sock`. Verified
+  at PR time by
+  `tests/test_docker_executor.py::test_sandbox_runner_has_no_docker_sock_mount`,
+  and at runtime by `scripts/pass2_docker.py` section 0a
+  (which reads `/proc/self/mountinfo` from inside the running
+  worker).
+* `sandbox-runner` reaches the daemon only via
+  `DOCKER_HOST=tcp://docker-socket-proxy:2375`. The Docker SDK's
+  `docker.from_env()` constructor honours that env var, so no
+  executor code changes were needed.
+* `docker-socket-proxy` exposes port `2375` **on the compose
+  network only** (no `ports:` entry, no host publishing).
+* The proxy runs `read_only: true`, `cap_drop: [ALL]`,
+  `security_opt: [no-new-privileges:true]`, and binds the host
+  socket **read-only**. It is the only container in the stack with
+  visibility of `/var/run/docker.sock`.
+
+Engine API surface exposed (1 = allowed, 0 = blocked → HTTP 403):
+
+| Family      | Setting | Why                                                                                       |
+| ----------- | :-----: | ----------------------------------------------------------------------------------------- |
+| PING        |    1    | Docker SDK calls `/_ping` on connect.                                                     |
+| VERSION     |    1    | Docker SDK calls `/version` on connect.                                                   |
+| CONTAINERS  |    1    | `containers.create`/`get`/`start`/`exec_run`/`remove`/`reload`/`put_archive`/`get_archive`. |
+| NETWORKS    |    1    | `networks.create`/`get`/`connect`/`disconnect`/`remove`/`reload`.                          |
+| VOLUMES     |    1    | `volumes.create`/`remove`.                                                                |
+| EXEC        |    1    | `container.exec_run` → `POST /containers/{id}/exec`.                                       |
+| IMAGES      |    1    | Read-only image inspect/list (no BUILD).                                                  |
+| POST        |    1    | Permits POST/PUT/DELETE verbs **only on the allowed families above**.                      |
+| INFO        |    0    | Not needed by the executor; exposes host topology.                                        |
+| SWARM       |    0    | We do not run swarm.                                                                      |
+| SERVICES    |    0    | We do not run swarm services.                                                             |
+| TASKS       |    0    | Swarm tasks.                                                                              |
+| NODES       |    0    | Swarm nodes.                                                                              |
+| SECRETS     |    0    | Swarm secrets — irrelevant and dangerous.                                                 |
+| CONFIGS     |    0    | Swarm configs.                                                                            |
+| PLUGINS     |    0    | Daemon-loaded plugins; install would extend the trusted code base.                        |
+| SYSTEM      |    0    | `/system/df`, `/events`, etc. Not needed by the executor.                                 |
+| BUILD       |    0    | We never build images from the worker.                                                    |
+| COMMIT      |    0    | Image commit not needed.                                                                  |
+| AUTH        |    0    | We never push/pull authenticated registries from the worker.                              |
+| DISTRIBUTION|    0    | Registry distribution endpoints.                                                          |
+| SESSION     |    0    | BuildKit session endpoints.                                                               |
+| EVENTS      |    0    | Daemon event stream not needed by the executor.                                           |
+
+This contract is enforced in two independent places:
+
+1. **Static (CI)**: `test_docker_socket_proxy_service_exists_with_hardened_policy`
+   parses `infra/docker-compose.yml` and asserts each value above.
+   A PR that flips `BUILD: 1` or `SWARM: 1` fails CI long before
+   reaching the VPS.
+2. **Runtime (acceptance probe)**: `pass2_docker.py` section 0a
+   makes raw HTTP requests to
+   `http://docker-socket-proxy:2375/<endpoint>` and asserts 2xx for
+   allowed paths and **HTTP 403** for `info`, `swarm`, `plugins`,
+   `services`, `tasks`, `nodes`, `secrets`, `configs`, `events`,
+   `system/df`, and `POST /build`.
+
+For why we are NOT switching the host to rootless Docker at the
+same time (and the exact path to do so in v0.4), see
+[`docs/ROOTLESS_DOCKER.md`](./ROOTLESS_DOCKER.md).
+
 The traffic flow on a preview hit is:
 
 ```

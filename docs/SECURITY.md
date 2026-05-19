@@ -128,6 +128,57 @@ The sandbox entrypoint runs as the `agent` user. It cannot `sudo`, cannot
 `chmod +s`, and cannot mount filesystems. Even if RCE is achieved inside
 the container, escalation requires a kernel exploit.
 
+### Layer 6 — Docker socket gatekeeper (v0.3)
+
+The `sandbox-runner` worker drives Docker through a filtering proxy
+instead of holding the host socket directly.
+
+```
+sandbox-runner ──▶ tcp://docker-socket-proxy:2375 ──▶ /var/run/docker.sock (host)
+                          (allowlist filter)               (ro mount, proxy only)
+```
+
+* The worker no longer bind-mounts `/var/run/docker.sock`. That bind
+  used to mean "a bug in the worker = root on the host"; it is gone.
+* The worker connects via `DOCKER_HOST=tcp://docker-socket-proxy:2375`
+  on the compose network. The proxy port is not published on the host.
+* The proxy itself runs the `tecnativa/docker-socket-proxy:0.2.0`
+  image with `read_only: true`, `cap_drop: [ALL]`,
+  `security_opt: [no-new-privileges:true]`, and the host socket
+  mounted **read-only**. It is the only container in the stack that
+  can see `/var/run/docker.sock`.
+* Allowed Engine API surfaces (CONTAINERS, NETWORKS, VOLUMES, EXEC,
+  IMAGES, plus PING and VERSION for the SDK handshake) cover exactly
+  what `DockerSandboxExecutor` actually calls.
+* Everything else returns **HTTP 403** at the proxy: SWARM, SERVICES,
+  TASKS, NODES, SECRETS, CONFIGS, PLUGINS, SYSTEM (incl.
+  `/system/df`, `/events`), BUILD, COMMIT, AUTH, DISTRIBUTION,
+  SESSION, INFO.
+
+A run-time probe (`workers/sandbox-runner/scripts/pass2_docker.py`,
+section 0a) calls each blocked endpoint against the live proxy and
+asserts 403. A static probe
+(`tests/test_docker_executor.py::test_docker_socket_proxy_service_exists_with_hardened_policy`)
+asserts the compose file still encodes this contract at PR review
+time — flips like `BUILD=1` or `SWARM=1` fail CI before reaching the
+VPS.
+
+**What this still does NOT defend against:**
+
+* A bug in *Tecnativa's filter logic itself*. The proxy is small
+  (a single haproxy config) but it is in the trusted path.
+* Misuse of an **allowed** endpoint — e.g. `POST /containers/create`
+  with `HostConfig.Privileged: true`. That escape is what
+  [`docs/ROOTLESS_DOCKER.md`](./ROOTLESS_DOCKER.md) discusses as the
+  v0.4 mitigation.
+* An attacker who already has shell on `sandbox-runner` and can
+  craft Engine API calls; the proxy reduces blast radius but does
+  not eliminate it.
+
+See [`docs/ROOTLESS_DOCKER.md`](./ROOTLESS_DOCKER.md) for the
+feasibility analysis of rootless Docker as the next layer beyond
+v0.3.
+
 ## Secret management
 
 - `.env` files are loaded via `pydantic-settings` and never logged.

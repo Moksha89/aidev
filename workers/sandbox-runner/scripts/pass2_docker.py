@@ -1,35 +1,74 @@
-"""Phase C Pass 2 (v0.2): real DockerSandboxExecutor acceptance walkthrough.
+"""Phase C Pass 2 (v0.3): real DockerSandboxExecutor acceptance walkthrough.
 
 Run inside ``infra-sandbox-runner-1`` (as root, so the docker socket is
 accessible). The orchestrator in ``apps/api`` always uses the mock; this
 script exercises the executor end-to-end against the running Docker
 daemon to validate every guarantee called out in
-``docs/SANDBOX_EXECUTOR.md`` plus the v0.2 hardening:
+``docs/SANDBOX_EXECUTOR.md`` plus the v0.2/v0.3 hardening:
 
-  1. Container safety profile (kernel-level): caps, ro rootfs, npp...
-  2. Dual-network layout: agent on internal sandbox bridge only;
-     forwarder multi-homed; egress-proxy attached to sandbox.
-  3. Agent has NO default route to the internet.
-  4. Direct curl to a raw public IP (1.1.1.1) fails at the kernel.
-  5. ``unset HTTP_PROXY`` still cannot reach the internet.
-  6. Allowed allowlist endpoint (GitHub) works through the proxy.
-  7. Disallowed hostname fails at the proxy.
-  8. Frontend-first FS protection still blocks backend/.env writes.
-  9. Preview URL works end-to-end through the forwarder.
- 10. Cleanup removes forwarder + agent + both networks + volume.
+  0a. v0.3 Docker socket gatekeeper:
+      sandbox-runner has no /var/run/docker.sock bind; DOCKER_HOST
+      points at the proxy; the proxy answers /_ping and /version;
+      disallowed Docker API endpoints (info, swarm, plugins, build,
+      services, system) return HTTP 403; allowed endpoints
+      (containers, networks, volumes) return 2xx.
+  1.  Container safety profile (kernel-level): caps, ro rootfs, npp...
+  2.  Dual-network layout: agent on internal sandbox bridge only;
+      forwarder multi-homed; egress-proxy attached to sandbox.
+  3.  Agent has NO default route to the internet.
+  4.  Direct curl to a raw public IP (1.1.1.1) fails at the kernel.
+  5.  ``unset HTTP_PROXY`` still cannot reach the internet.
+  6.  Allowed allowlist endpoint (GitHub) works through the proxy.
+  7.  Disallowed hostname fails at the proxy.
+  8.  Frontend-first FS protection still blocks backend/.env writes.
+  9.  Preview URL works end-to-end through the forwarder.
+ 10.  Cleanup removes forwarder + agent + both networks + volume.
 """
 from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sys
 import time
+import urllib.error
+import urllib.request
 
 import docker
 from aidev_shared import TaskPhase
 
 from sandbox_runner.config import SandboxConfig
 from sandbox_runner.docker_executor import DockerSandboxExecutor
+
+DOCKER_SOCKET_PROXY_HOST = os.environ.get(
+    "AIDEV_DOCKER_SOCKET_PROXY_HOST", "docker-socket-proxy"
+)
+DOCKER_SOCKET_PROXY_PORT = int(
+    os.environ.get("AIDEV_DOCKER_SOCKET_PROXY_PORT", "2375")
+)
+
+
+def proxy_status(method: str, path: str, *, timeout: float = 5.0) -> int:
+    """Hit ``http://docker-socket-proxy:2375<path>`` directly and return
+    the HTTP status code (or 0 on a transport error).
+
+    Used by section 0a to prove the proxy's allowlist/blocklist is
+    actually enforced at runtime — independently of the Docker SDK,
+    which would hide a 403 inside a Python exception.
+    """
+
+    url = (
+        f"http://{DOCKER_SOCKET_PROXY_HOST}:{DOCKER_SOCKET_PROXY_PORT}{path}"
+    )
+    req = urllib.request.Request(url, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return int(resp.status)
+    except urllib.error.HTTPError as exc:
+        # Tecnativa's proxy returns 403 for blocked endpoints.
+        return int(exc.code)
+    except (urllib.error.URLError, TimeoutError, ConnectionError):
+        return 0
 
 
 def banner(text: str) -> None:
@@ -99,6 +138,97 @@ async def main() -> int:
         "model_server_host": cfg.model_server_host,
         "task_timeout_seconds": cfg.task_timeout_seconds,
     })
+
+    banner("0a. v0.3 Docker socket gatekeeper")
+    # (1) DOCKER_HOST is set on this worker container itself. The
+    # Docker SDK below will obey it via ``docker.from_env()``.
+    docker_host = os.environ.get("DOCKER_HOST", "")
+    check(
+        "DOCKER_HOST points at docker-socket-proxy:2375",
+        docker_host == f"tcp://{DOCKER_SOCKET_PROXY_HOST}:"
+        f"{DOCKER_SOCKET_PROXY_PORT}",
+        f"DOCKER_HOST={docker_host!r}",
+    )
+
+    # (2) This worker container has NO host docker.sock bind. We
+    # inspect /proc/self/mountinfo (running as root in the worker)
+    # to be sure the v0.2 mount was actually removed from compose.
+    try:
+        with open("/proc/self/mountinfo", encoding="utf-8") as fh:
+            mountinfo = fh.read()
+    except OSError as exc:
+        mountinfo = ""
+        print(f"  (could not read mountinfo: {exc!r})")
+    sock_mounts = [
+        ln for ln in mountinfo.splitlines() if "docker.sock" in ln
+    ]
+    check(
+        "sandbox-runner has NO /var/run/docker.sock bind in its mounts",
+        sock_mounts == [],
+        f"offending mountinfo lines={sock_mounts!r}",
+    )
+
+    # (3) The proxy is reachable at all, and answers the SDK handshake
+    # endpoints (`/_ping` and `/version`) with 2xx.
+    ping = proxy_status("GET", "/_ping")
+    check(
+        "proxy /_ping returns 2xx (allowlist: PING=1)",
+        200 <= ping < 300,
+        f"http={ping}",
+    )
+    version = proxy_status("GET", "/version")
+    check(
+        "proxy /version returns 2xx (allowlist: VERSION=1)",
+        200 <= version < 300,
+        f"http={version}",
+    )
+
+    # (4) Endpoints the executor actually needs are reachable.
+    for label, path in (
+        ("containers", "/containers/json?all=true"),
+        ("networks", "/networks"),
+        ("volumes", "/volumes"),
+        ("images", "/images/json"),
+    ):
+        rc = proxy_status("GET", path)
+        check(
+            f"proxy GET {path} returns 2xx (allowlist: {label.upper()})",
+            200 <= rc < 300,
+            f"http={rc}",
+        )
+
+    # (5) Endpoints we DO NOT need must be blocked. Tecnativa's image
+    # answers blocked routes with HTTP 403 even from an internal
+    # client — proving the surface really is filtered.
+    blocked_endpoints = (
+        ("info", "/info"),
+        ("swarm", "/swarm"),
+        ("plugins", "/plugins"),
+        ("services", "/services"),
+        ("tasks", "/tasks"),
+        ("nodes", "/nodes"),
+        ("secrets", "/secrets"),
+        ("configs", "/configs"),
+        ("system events", "/events"),
+        # /system/df is the canonical SYSTEM=0 check.
+        ("system df", "/system/df"),
+    )
+    for label, path in blocked_endpoints:
+        rc = proxy_status("GET", path)
+        check(
+            f"proxy GET {path} -> 403 (blocklist: {label})",
+            rc == 403,
+            f"http={rc}",
+        )
+
+    # POST /build is the BUILD=0 check. The proxy answers 403 for
+    # POST too because POST=1 only opens POST on *allowed* families.
+    rc = proxy_status("POST", "/build")
+    check(
+        "proxy POST /build -> 403 (blocklist: build)",
+        rc == 403,
+        f"http={rc}",
+    )
 
     client = docker.from_env()
     # Pre-pull the curl sidecar image so the first curl_from_host() call

@@ -691,3 +691,202 @@ async def test_session_disconnects_endpoints_before_network_remove(
         f"got disconnects={network.disconnects!r}"
     )
     assert network.removed, "network.remove() must succeed after disconnect"
+
+
+# ---- v0.3 Docker socket gatekeeper -----------------------------------------
+#
+# These tests are *static checks against `infra/docker-compose.yml`*. They
+# encode the v0.3 contract:
+#
+#   1. The sandbox-runner worker has NO direct bind on /var/run/docker.sock.
+#   2. The sandbox-runner worker reaches the Docker Engine API only via
+#      `DOCKER_HOST=tcp://docker-socket-proxy:2375`.
+#   3. A `docker-socket-proxy` service exists with the right allow/deny
+#      policy and the right hardening (read-only mount, cap_drop=ALL,
+#      no host port).
+#
+# If anyone ever re-mounts the host socket on sandbox-runner, or drops
+# `DOCKER_HOST`, or weakens the proxy policy (e.g. flips BUILD=1 or
+# SWARM=1 or SYSTEM=1), these tests fail at PR review time — long
+# before the change reaches the VPS.
+
+
+def _load_compose() -> dict[str, Any]:
+    import yaml
+
+    repo_root = Path(__file__).resolve().parents[3]
+    compose_path = repo_root / "infra" / "docker-compose.yml"
+    with compose_path.open(encoding="utf-8") as fh:
+        return yaml.safe_load(fh)
+
+
+def test_sandbox_runner_has_no_docker_sock_mount() -> None:
+    compose = _load_compose()
+    svc = compose["services"]["sandbox-runner"]
+    volumes = svc.get("volumes", [])
+    assert isinstance(volumes, list), volumes
+    offenders = [v for v in volumes if "docker.sock" in str(v)]
+    assert offenders == [], (
+        "sandbox-runner must NOT bind the host docker socket directly. "
+        "It must reach Docker via the docker-socket-proxy service. "
+        f"Offending volumes: {offenders!r}"
+    )
+
+
+def test_sandbox_runner_routes_docker_via_proxy() -> None:
+    compose = _load_compose()
+    svc = compose["services"]["sandbox-runner"]
+    env = svc.get("environment", {})
+    assert isinstance(env, dict), env
+    docker_host = env.get("DOCKER_HOST")
+    assert docker_host == "tcp://docker-socket-proxy:2375", (
+        "sandbox-runner must set DOCKER_HOST=tcp://docker-socket-proxy:2375 "
+        f"so the Docker SDK routes calls through the gatekeeper. Got: "
+        f"{docker_host!r}"
+    )
+    depends_on = svc.get("depends_on", {})
+    assert "docker-socket-proxy" in depends_on, (
+        "sandbox-runner must depend_on docker-socket-proxy so the proxy is "
+        "up before any Docker SDK call is issued."
+    )
+
+
+def test_docker_socket_proxy_service_exists_with_hardened_policy() -> None:
+    compose = _load_compose()
+    services = compose["services"]
+    assert "docker-socket-proxy" in services, (
+        "v0.3 requires a docker-socket-proxy service in front of the host "
+        "Docker daemon"
+    )
+    proxy = services["docker-socket-proxy"]
+
+    # Image pinned (no floating `latest`).
+    assert ":" in proxy["image"], proxy["image"]
+    assert proxy["image"].startswith("tecnativa/docker-socket-proxy:"), proxy[
+        "image"
+    ]
+
+    # Only the proxy still binds the host socket — and read-only.
+    proxy_volumes = proxy.get("volumes", [])
+    sock_binds = [v for v in proxy_volumes if "docker.sock" in str(v)]
+    assert sock_binds, "the proxy must bind the host docker.sock to forward"
+    for v in sock_binds:
+        assert str(v).endswith(":ro"), (
+            f"docker-socket-proxy must mount /var/run/docker.sock READ-ONLY; "
+            f"got: {v!r}"
+        )
+
+    # No host port: the proxy must only be reachable on the compose network.
+    assert "ports" not in proxy, (
+        "docker-socket-proxy must NOT publish a host port — it is internal-only"
+    )
+
+    # Hardening flags expected on the proxy itself.
+    assert proxy.get("read_only") is True
+    assert proxy.get("cap_drop") == ["ALL"]
+    assert "no-new-privileges:true" in proxy.get("security_opt", [])
+
+    # API allowlist: only the families the executor needs.
+    env = proxy["environment"]
+    for allowed in ("CONTAINERS", "NETWORKS", "VOLUMES", "EXEC", "IMAGES", "POST"):
+        assert env.get(allowed) == 1, (
+            f"docker-socket-proxy must allow {allowed} (got {env.get(allowed)!r})"
+        )
+    # Required by the SDK on connect.
+    for required in ("PING", "VERSION"):
+        assert env.get(required) == 1, (
+            f"docker-socket-proxy must allow {required} for SDK handshake "
+            f"(got {env.get(required)!r})"
+        )
+
+    # API blocklist: must be explicitly off. This is the v0.3 contract;
+    # do NOT relax these without an architecture review.
+    blocked = (
+        "AUTH",
+        "BUILD",
+        "COMMIT",
+        "CONFIGS",
+        "DISTRIBUTION",
+        "EVENTS",
+        "INFO",
+        "NODES",
+        "PLUGINS",
+        "SECRETS",
+        "SERVICES",
+        "SESSION",
+        "SWARM",
+        "SYSTEM",
+        "TASKS",
+    )
+    for denied in blocked:
+        assert env.get(denied) == 0, (
+            f"docker-socket-proxy must block {denied} (got {env.get(denied)!r}). "
+            f"v0.3 contract: only containers/networks/volumes/exec/images/ping/"
+            f"version are reachable via the proxy."
+        )
+
+
+# ---- v0.3 executor-side wiring ---------------------------------------------
+
+
+def test_executor_falls_back_to_from_env_when_no_base_url(
+    config: SandboxConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When AIDEV_SANDBOX_DOCKER_URL is unset (the v0.3 default), the
+    executor must construct its Docker client via `docker.from_env()` so
+    the SDK picks up `DOCKER_HOST=tcp://docker-socket-proxy:2375` from
+    the environment. We don't want to second-guess the SDK — but we do
+    want a regression test that nobody re-introduces a hard-coded
+    `unix:///var/run/docker.sock`.
+    """
+
+    sentinel = object()
+
+    calls: dict[str, Any] = {}
+
+    class _FakeDockerModule:
+        @staticmethod
+        def from_env() -> Any:
+            calls["from_env"] = True
+            return sentinel
+
+        class DockerClient:  # pragma: no cover — should NOT be called
+            def __init__(self, *args: Any, **kwargs: Any) -> None:
+                calls["DockerClient"] = (args, kwargs)
+
+    import sys
+
+    monkeypatch.setitem(sys.modules, "docker", _FakeDockerModule)
+
+    # No docker_base_url set on the config → must use from_env().
+    cfg = SandboxConfig(
+        image=config.image,
+        cpus=config.cpus,
+        mem_limit=config.mem_limit,
+        pids_limit=config.pids_limit,
+        task_timeout_seconds=config.task_timeout_seconds,
+        agent_uid=config.agent_uid,
+        egress_proxy_url=config.egress_proxy_url,
+        egress_proxy_alias=config.egress_proxy_alias,
+        model_server_host=config.model_server_host,
+        preview_mode=config.preview_mode,
+        preview_public_host=config.preview_public_host,
+        preview_port_range_start=config.preview_port_range_start,
+        preview_port_range_end=config.preview_port_range_end,
+        traefik_dynamic_dir=config.traefik_dynamic_dir,
+        preview_domain=config.preview_domain,
+        redis_url=config.redis_url,
+        docker_base_url=None,
+    )
+    exe = DockerSandboxExecutor(config=cfg)
+    client = exe._get_client()
+
+    assert client is sentinel, (
+        "executor must build its client via docker.from_env() when no "
+        "docker_base_url is set, so DOCKER_HOST=tcp://docker-socket-proxy:2375 "
+        "from the compose env is honoured by the SDK"
+    )
+    assert calls.get("from_env") is True
+    assert "DockerClient" not in calls, (
+        "executor must NOT bypass DOCKER_HOST by hard-coding a base_url"
+    )
