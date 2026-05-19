@@ -24,19 +24,23 @@ Select via `SANDBOX_EXECUTOR=docker` (defaults to `mock`). See
 2. **Frontend-first enforced at three layers**: prompt, rules engine,
    filesystem. The agent cannot accidentally write a backend file
    pre-approval *even if* layers 1 and 2 are bypassed by a future bug.
-3. **Allowlist egress.** Every sandbox container has
-   `HTTP_PROXY` / `HTTPS_PROXY` pointed at the per-task-attached
-   `aidev-egress-proxy` (tinyproxy) sidecar, which deny-by-defaults
-   anything not on the allowlist. Currently *cooperative* — see
-   "Known limitations" below for the kernel-level follow-up.
-4. **Cleanup is not optional.** Container, volume, network, and preview
+3. **Kernel-enforced egress isolation (v0.2).** The agent container
+   lives on a per-task ``internal: true`` Docker bridge with **no
+   default gateway** to anything off-bridge. ``curl https://1.1.1.1``
+   inside the sandbox fails with `Network is unreachable` even when
+   ``HTTP_PROXY`` env vars are unset. The only path out is the
+   `aidev-egress-proxy` (tinyproxy) sidecar, reachable on the same
+   internal bridge by DNS alias, which deny-by-defaults anything not
+   on the allowlist. See ["v0.2 network layout"](#v02-network-layout).
+4. **Cleanup is not optional.** Forwarder, agent container, volume,
+   both networks, the egress-proxy attachment, and preview
    registration (port allocation in IP-only mode, or Traefik dynamic
    file in domain mode) are all removed in a `finally` block; if any
    step fails it is logged but the others still run.
 
 ## Container safety profile
 
-`DockerSandboxExecutor` creates each container with:
+`DockerSandboxExecutor` creates each AGENT container with:
 
 ```
 image           aidev/sandbox:latest         # node:20 + py3.11 + playwright + gh
@@ -47,14 +51,90 @@ read_only       true                         # root FS is read-only
 tmpfs           /tmp (512m), /home/agent/.cache (512m)
 security_opt    no-new-privileges:true
 cap_drop        ALL                          # drop every Linux capability
+cap_add         [CHOWN, FOWNER]              # minimum for fs_protection chmods;
+                                             # DAC_OVERRIDE intentionally NOT added
 mem_limit       4g                           # AIDEV_SANDBOX_MEM_LIMIT
 nano_cpus       2e9                          # AIDEV_SANDBOX_CPUS (2 CPUs)
 pids_limit      512                          # AIDEV_SANDBOX_PIDS_LIMIT
-network         aidev_sandbox_<task_id>      # per-task bridge; egress proxy attached
+network         aidev_sandbox_<task_id>      # internal=true, no default gw
+ports           (none)                       # see "v0.2 network layout"
 volumes         aidev-sandbox-vol-<task_id>:/workspace   # only mount
 ```
 
-No host bind mounts, no Docker socket inside, no host network access.
+No host bind mounts, no Docker socket inside, no host network access,
+**no host port bindings on the agent itself** (the forwarder owns them).
+
+Each task also brings up a per-task `aidev/forwarder:latest` sidecar with
+a much tighter profile (UID 10002, no caps, no volumes, no tmpfs, 0.5
+CPU / 128 MiB / 64 pids). It runs a single `socat TCP-LISTEN:3000,fork
+TCP:<agent>:3000` process.
+
+## v0.2 network layout
+
+Every task gets **two** dedicated Docker networks and a forwarder
+sidecar:
+
+```
+   host :31xxx ───────────────► docker-proxy
+                                       │
+                              aidev_pub_<task>         (bridge, plain, MASQUERADE on)
+                                       │
+                              [forwarder sidecar]
+                                       │
+                              aidev_sandbox_<task>     (bridge, INTERNAL=true, no gw)
+                          ┌────────────┼─────────────────────────┐
+                     [agent :3000]                     [egress-proxy alias]
+                                                                 │
+                                                     infra_default (bridge, plain)
+                                                                 │
+                                                       internet (allowlist only)
+```
+
+What lives where:
+
+| Container        | aidev_pub_\<task\> | aidev_sandbox_\<task\> | infra_default |
+| ---------------- | :----------------: | :--------------------: | :-----------: |
+| agent            |       –            |          ✓ (only)      |       –       |
+| forwarder        |       ✓            |          ✓             |       –       |
+| egress-proxy     |       –            |          ✓ (per-task)  |       ✓ (primary) |
+
+Why each network exists:
+
+1. **`aidev_sandbox_<task>` — `internal: true`.** Docker installs no
+   MASQUERADE and no default gateway for an internal bridge. The agent
+   container has *only* this NIC, so its routing table has no
+   `default via …` entry and the kernel refuses to send any packet to
+   an off-bridge address. `unset HTTP_PROXY HTTPS_PROXY` and try
+   `curl https://1.1.1.1` → `Network is unreachable`. This is what
+   "kernel-enforced" means in design goal 3.
+2. **`aidev_pub_<task>` — plain bridge.** Host port publishing
+   requires a NAT'd bridge. The forwarder sits here so docker-proxy
+   has somewhere to deliver `host:31xxx → :3000` traffic. The agent
+   is **never** on this network and never gets a route through it.
+3. **egress-proxy multi-homing.** The shared egress proxy keeps its
+   primary attachment on `infra_default` (where it has its own
+   default route to the internet) and is `network.connect()`'d to
+   each per-task `aidev_sandbox_<task>` as a *second* NIC. Because
+   the per-task bridge is internal, attaching it does **not** rewrite
+   the proxy's default route — verified empirically on Docker 27.x
+   against a multi-homed test container. The agent reaches the proxy
+   over L2 on the internal subnet by DNS alias `aidev-egress-proxy`.
+
+Together these three pieces close the gap between v0.1's "cooperative
+egress" (HTTP_PROXY env vars + tinyproxy allowlist; bypassable by
+unsetting env or curling a raw IP) and v0.2's "kernel-enforced egress"
+(no route to anywhere except the proxy alias on the internal subnet,
+period).
+
+The traffic flow on a preview hit is:
+
+```
+   browser   →   <vps-ip>:31xxx        (host port via UFW operator /32)
+             →   docker-proxy          (host networking)
+             →   forwarder :3000       (on aidev_pub_<task>)
+             →   socat TCP-CONNECT     (over aidev_sandbox_<task>)
+             →   agent :3000           (dev server inside sandbox)
+```
 
 Task wall-clock is capped at `AIDEV_SANDBOX_TIMEOUT_SECONDS` (default
 `1800` / 30 min). Each `session.run()` call is further capped by the
@@ -95,27 +175,32 @@ both together.
 
 ## Network egress allowlist
 
-Every sandbox container has `HTTP_PROXY` / `HTTPS_PROXY` env vars
-pointed at the `aidev-egress-proxy` (tinyproxy) sidecar attached to
-its per-task bridge:
+In v0.2 the per-task sandbox bridge is `internal: true` and the agent
+container has **only** this NIC, so kernel routing already denies all
+off-bridge traffic. The egress proxy is then connected to the same
+internal bridge as the agent's only reachable peer:
 
 ```
-        sandbox container                   egress-proxy
-       (per-task bridge)                   (tinyproxy sidecar)
+        agent container                     egress-proxy
+   (aidev_sandbox_<task>, internal=true)   (aidev_sandbox_<task> + infra_default)
               │                                   │
               │  HTTP(S)_PROXY=http://aidev-      │  filters by anchored
               │     egress-proxy:8888 ────────────▶  regex allowlist;
-              │                                   │  deny-by-default
-              │                                   ▼
+              │  (DNS alias over the              │  deny-by-default
+              │   internal subnet)                ▼
                                               upstream internet
+                                              (via infra_default)
 ```
 
-The proxy enforces a hostname allowlist (anchored regex,
-deny-by-default). Any HTTP / HTTPS client that honours `HTTP_PROXY`
-(curl, wget, pip, npm, pnpm, go, cargo, requests, urllib, axios, fetch
-via Node, …) goes through tinyproxy and is filtered. Direct outbound
-to raw IPs from the sandbox is *not* blocked at the kernel layer —
-see "Known limitations" below.
+Two doors that must BOTH be open before any byte reaches the internet:
+
+1. **Kernel door** — there must be a route. On `internal: true` there
+   is none. The agent cannot send a single SYN packet to anywhere
+   except the sandbox subnet, regardless of what's in its env.
+2. **Proxy door** — even for hosts on the subnet, the only one
+   listening that goes anywhere off-bridge is `aidev-egress-proxy`,
+   which then enforces the anchored regex allowlist.
+
 
 Default allowlist (`sandbox_runner.egress.DEFAULT_ALLOWLIST`):
 
@@ -320,16 +405,26 @@ AIDEV_SANDBOX_PREVIEW_DOMAIN=<your-preview-domain>
 Open one task end-to-end through the dashboard; in another shell:
 
 ```sh
-CID=$(docker ps --filter "label=aidev.sandbox=true" -q | head -1)
+CID=$(docker ps --filter "label=com.aidev.role=sandbox" -q | head -1)
+FID=$(docker ps --filter "label=com.aidev.role=forwarder" -q | head -1)
 docker inspect "$CID" --format '{{.HostConfig.Memory}}'         # → 4294967296   (4g)
 docker inspect "$CID" --format '{{.HostConfig.NanoCpus}}'       # → 2000000000   (2 cpus)
 docker inspect "$CID" --format '{{.HostConfig.PidsLimit}}'      # → 512
 docker inspect "$CID" --format '{{.HostConfig.ReadonlyRootfs}}' # → true
 docker inspect "$CID" --format '{{.HostConfig.SecurityOpt}}'    # contains   no-new-privileges:true
 docker inspect "$CID" --format '{{.HostConfig.CapDrop}}'        # → [ALL]
+docker inspect "$CID" --format '{{.HostConfig.CapAdd}}'         # → [CHOWN FOWNER]
 docker inspect "$CID" --format '{{.Config.User}}'               # → 10001:10001
 docker inspect "$CID" --format '{{.HostConfig.NetworkMode}}'    # → aidev_sandbox_<task-id>
+docker inspect "$CID" --format '{{.HostConfig.PortBindings}}'   # → map[]   (agent publishes NO host ports)
 docker network inspect aidev_sandbox_<task-id> --format '{{.Internal}}'  # → true
+docker network inspect aidev_pub_<task-id> --format '{{.Internal}}'      # → false  (forwarder needs MASQUERADE)
+docker inspect "$FID" --format '{{.HostConfig.PortBindings}}'   # → contains 3000/tcp → 31xxx
+docker inspect "$FID" --format '{{range $k,$v := .NetworkSettings.Networks}}{{$k}} {{end}}'
+                                                                  # → aidev_pub_<task-id> aidev_sandbox_<task-id>
+docker inspect aidev-egress-proxy \
+    --format '{{range $k,$v := .NetworkSettings.Networks}}{{$k}} {{end}}'
+                                                                  # → infra_default aidev_sandbox_<task-id>
 ```
 
 Every line must match the expected value. A miss = stop and
@@ -382,12 +477,23 @@ docker exec "$CID" env HTTPS_PROXY=http://aidev-egress-proxy:8888 \
 #  expect:  403
 ```
 
-Bypass attempt — currently *informational only* (cooperative egress):
+Bypass tests — v0.2 kernel-enforced isolation. The agent's routing
+table has no `default via …` entry, so the kernel refuses to send any
+off-bridge packet regardless of what's in env:
 
 ```sh
-docker exec "$CID" sh -c 'unset HTTP_PROXY HTTPS_PROXY; curl --connect-timeout 5 -sS -o /dev/null -w "%{http_code}\n" https://1.1.1.1'
-#  expect today:  any 2xx/3xx  (sandbox CAN currently reach raw IPs)
-#  expected after v0.2 sidecar-forwarder hardening:  000 (no route)
+docker exec -u 10001 "$CID" ip -4 route show
+#  expect:  ONE line, like '<sandbox-subnet> dev eth0 ...' — NO 'default via ...' anywhere
+
+docker exec -u 10001 "$CID" sh -c '
+    unset HTTP_PROXY HTTPS_PROXY http_proxy https_proxy NO_PROXY no_proxy;
+    curl --connect-timeout 3 -sS -o /dev/null -w "http=%{http_code}\n" https://1.1.1.1'
+#  expect:  http=000   (Network is unreachable / kernel route lookup fail)
+
+docker exec -u 10001 "$CID" sh -c '
+    unset HTTP_PROXY HTTPS_PROXY http_proxy https_proxy NO_PROXY no_proxy;
+    curl --connect-timeout 5 -sS -o /dev/null -w "http=%{http_code}\n" https://api.github.com/zen'
+#  expect:  http=000   (even an allowlisted host is unreachable without the proxy)
 ```
 
 See "Known limitations" below for why this check is informational and

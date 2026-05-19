@@ -1,16 +1,41 @@
-"""Docker-in-Docker sandbox executor — the real one.
+"""Docker-in-Docker sandbox executor — the real one (v0.2 layout).
 
-One ephemeral container per task. Resource caps, non-root user,
-read-only root filesystem, no-new-privileges, isolated `internal: true`
-network, egress only through the allowlist proxy sidecar.
+One ephemeral *agent* container per task plus a per-task *forwarder*
+sidecar. The agent lives on an ``internal: true`` bridge (no default
+gateway, no MASQUERADE, no direct internet route). The forwarder sits
+on both that internal bridge AND a per-task plain bridge that absorbs
+the host's ``-p 31xxx:3000`` mapping, so IP-only previews keep working.
 
-The executor talks to the host Docker daemon through the `docker` SDK.
-The agent-runner consumes the resulting `SandboxSession` through the
-`SandboxExecutor` protocol — no code in the agent layer cares whether
-the session is backed by the mock or by a real container.
+Network picture per task::
 
-See `docs/SANDBOX_EXECUTOR.md` for the full design and operational
-notes (resource caps, allowlist, fs-protection layer).
+    host :31xxx ────────────────► docker-proxy
+                                       │
+                            aidev_pub_<task>  (plain bridge, MASQUERADE)
+                                       │
+                              [forwarder sidecar]
+                                       │
+                            aidev_sandbox_<task>  (internal: true, NO gw)
+                          ┌────────────┼────────────────────┐
+                     [agent :3000]                    [egress-proxy alias]
+                                                            │
+                                              infra_default (plain bridge)
+                                                            │
+                                                       internet (allowlist)
+
+The egress-proxy container itself lives on ``infra_default`` (which is
+where it gets its default route to the internet). It is then attached
+as a *second* NIC to each per-task ``aidev_sandbox_<task>`` network via
+``network.connect()``. Empirically (and per the docker SDK code path),
+attaching an ``internal: true`` network as an additional NIC does NOT
+rewrite the container's default gateway — the new network simply has
+no gateway, so the kernel keeps the existing default route. The agent
+reaches the proxy by docker DNS over L2 on the internal subnet; the
+proxy reaches the internet over its primary NIC.
+
+Resource caps, non-root user, read-only root filesystem,
+``no-new-privileges``, and the frontend-first FS protection layer all
+carry over unchanged from v0.1/PR #4. See ``docs/SANDBOX_EXECUTOR.md``
+for the full operational checklist.
 """
 
 from __future__ import annotations
@@ -418,23 +443,35 @@ class DockerSandboxExecutor:
 
     1. Pre-flight: validate config, build the egress allowlist, publish
        a `sandbox.starting` event.
-    2. Create a per-task network with `internal: true`. If an egress
-       proxy is configured, attach the proxy container to the network.
+    2. Create TWO per-task networks:
+       * ``aidev_pub_<id>`` — plain bridge for the forwarder sidecar
+         (host published port lives here).
+       * ``aidev_sandbox_<id>`` — ``internal: true`` bridge for the
+         agent + egress-proxy multihome.
+       If an egress proxy is configured, attach the proxy container to
+       the sandbox network.
     3. Create a named volume `aidev-sandbox-vol-<task_id>` for the
        workspace. The volume is mounted at `/workspace` so writes
        survive across `docker exec` calls but vanish when we remove it.
-    4. Create the sandbox container with the full safety profile:
+    4. Create the agent container on the *internal* network only with
+       the full safety profile:
        - `read_only=True`, `tmpfs={'/tmp': '...'}`
        - `security_opt=['no-new-privileges:true']`
-       - `cap_drop=['ALL']`
+       - `cap_drop=['ALL']` + minimum `cap_add=['CHOWN','FOWNER']`
        - `user=10001:10001`
        - `mem_limit`, `nano_cpus`, `pids_limit`
        - `environment` includes HTTP(S)_PROXY pointing at the sidecar
-    5. Start the container, yield the `_DockerSession`.
-    6. On context exit (or timeout / exception):
-       - Stop + remove the container with `force=True, v=True`.
+       - NO host port bindings — the forwarder handles those.
+    5. Create the forwarder container on the *pub* network with the
+       host port published, then connect it to the *internal*
+       network so it can reach the agent.
+    6. Start both containers, yield the `_DockerSession`.
+    7. On context exit (or timeout / exception):
+       - Stop + remove the forwarder.
+       - Disconnect the egress-proxy from the internal network.
+       - Stop + remove the agent container with `force=True, v=True`.
        - Remove the volume.
-       - Remove the network.
+       - Remove the internal network, then the pub network.
        - Deregister the Traefik preview route.
        - Publish `sandbox.finished` with the final phase.
     """
@@ -545,12 +582,24 @@ class DockerSandboxExecutor:
             },
         )
 
-        network = None
+        sandbox_network = None
+        pub_network = None
         volume = None
         container = None
+        forwarder = None
         try:
-            network = await asyncio.to_thread(
-                _create_network, client=client, name=self._config.network_name(task_id)
+            # Sandbox network is internal=true; agent lives here. Pub
+            # network is a plain bridge; forwarder lives there with the
+            # published host port.
+            sandbox_network = await asyncio.to_thread(
+                _create_sandbox_network,
+                client=client,
+                name=self._config.network_name(task_id),
+            )
+            pub_network = await asyncio.to_thread(
+                _create_public_network,
+                client=client,
+                name=self._config.public_network_name(task_id),
             )
             volume = await asyncio.to_thread(
                 _create_volume, client=client, name=self._config.volume_name(task_id)
@@ -567,31 +616,48 @@ class DockerSandboxExecutor:
             }
             env.update(proxy_env(proxy_url=self._config.egress_proxy_url))
 
-            port_bindings = (
-                port_allocation.port_bindings if port_allocation else None
-            )
+            # The agent container is *never* on the pub network and
+            # *never* publishes a host port. The forwarder owns both.
             container = await asyncio.to_thread(
                 _create_container,
                 client=client,
                 config=self._config,
                 task_id=task_id,
                 volume_name=volume.name,
-                network_name=network.name,
+                network_name=sandbox_network.name,
                 environment=env,
-                port_bindings=port_bindings,
             )
             await asyncio.to_thread(container.start)
 
-            # Wire the egress proxy onto our network if it's running on
-            # the host. Failures here are non-fatal — they just mean
-            # external traffic is blocked, which is the safe default.
+            # Wire the egress proxy onto our sandbox (internal) network
+            # so the agent can reach it by DNS alias. The proxy's
+            # default gateway stays on infra_default — attaching an
+            # internal network as a second NIC does not rewrite it.
+            # Failures here are non-fatal: the agent will simply have
+            # no working egress, which is the safe default.
             if self._config.egress_proxy_url:
                 await asyncio.to_thread(
                     _attach_egress_proxy,
                     client=client,
-                    network=network,
+                    network=sandbox_network,
                     alias=self._config.egress_proxy_alias,
                 )
+
+            # Forwarder sidecar — only created in port mode; traefik
+            # mode reaches the agent on the docker bridge directly.
+            if mode == "port" and port_allocation is not None:
+                forwarder = await asyncio.to_thread(
+                    _create_forwarder,
+                    client=client,
+                    config=self._config,
+                    task_id=task_id,
+                    pub_network_name=pub_network.name,
+                    sandbox_network_name=sandbox_network.name,
+                    agent_container_name=self._config.container_name(task_id),
+                    agent_port=self._config.preview_internal_port,
+                    port_bindings=port_allocation.port_bindings,
+                )
+                await asyncio.to_thread(forwarder.start)
 
             session = _DockerSession(
                 task_id=task_id,
@@ -609,7 +675,11 @@ class DockerSandboxExecutor:
                 kind="sandbox.started",
                 payload={
                     "container_id": getattr(container, "id", None),
-                    "network": network.name,
+                    "sandbox_network": sandbox_network.name,
+                    "public_network": pub_network.name,
+                    "forwarder": (
+                        getattr(forwarder, "name", None) if forwarder else None
+                    ),
                     "volume": volume.name,
                     "phase": initial_phase.value,
                     "preview_mode": mode,
@@ -638,6 +708,32 @@ class DockerSandboxExecutor:
                     logger.warning(
                         "preview.deregister failed for task %s", task_id
                     )
+            # Forwarder first: it's the only thing on the pub network,
+            # so removing it lets us drop the pub network cleanly.
+            if forwarder is not None:
+                try:
+                    await asyncio.to_thread(
+                        forwarder.remove, force=True, v=True
+                    )
+                except Exception:
+                    logger.warning(
+                        "forwarder.remove failed for task %s", task_id
+                    )
+            # Disconnect the egress proxy from the sandbox network
+            # before removing it; Docker refuses to remove a network
+            # that still has active endpoints.
+            if sandbox_network is not None and self._config.egress_proxy_url:
+                try:
+                    await asyncio.to_thread(
+                        _detach_egress_proxy,
+                        client=client,
+                        network=sandbox_network,
+                        alias=self._config.egress_proxy_alias,
+                    )
+                except Exception:
+                    logger.warning(
+                        "egress proxy detach failed for task %s", task_id
+                    )
             if container is not None:
                 try:
                     await asyncio.to_thread(container.remove, force=True, v=True)
@@ -648,34 +744,43 @@ class DockerSandboxExecutor:
                     await asyncio.to_thread(volume.remove, force=True)
                 except Exception:
                     logger.warning("volume.remove failed for task %s", task_id)
-            if network is not None:
-                # Disconnect any still-attached containers (egress proxy is
-                # the typical lingerer) so `network.remove` does not error
-                # with "has active endpoints". Best-effort; the eventual
-                # `remove` call is still wrapped in its own try/except.
+            # Disconnect any still-attached containers (egress proxy on
+            # sandbox_network, lingering forwarder on pub_network) so
+            # ``network.remove`` does not error with "has active
+            # endpoints". Best-effort; ``remove`` is still wrapped.
+            for _net_label, _net in (
+                ("sandbox_network", sandbox_network),
+                ("pub_network", pub_network),
+            ):
+                if _net is None:
+                    continue
                 try:
-                    await asyncio.to_thread(network.reload)
-                    attached = (network.attrs.get("Containers") or {}).keys()
+                    await asyncio.to_thread(_net.reload)
+                    attached = (_net.attrs.get("Containers") or {}).keys()
                     for cid in list(attached):
                         try:
                             await asyncio.to_thread(
-                                network.disconnect, cid, force=True
+                                _net.disconnect, cid, force=True
                             )
                         except Exception:
                             logger.warning(
-                                "network.disconnect failed for task %s container %s",
+                                "%s.disconnect failed for task %s container %s",
+                                _net_label,
                                 task_id,
                                 cid,
                             )
                 except Exception:
                     logger.warning(
-                        "could not enumerate network endpoints for task %s",
+                        "could not enumerate %s endpoints for task %s",
+                        _net_label,
                         task_id,
                     )
                 try:
-                    await asyncio.to_thread(network.remove)
+                    await asyncio.to_thread(_net.remove)
                 except Exception:
-                    logger.warning("network.remove failed for task %s", task_id)
+                    logger.warning(
+                        "%s.remove failed for task %s", _net_label, task_id
+                    )
             events.publish(
                 task_id=task_id,
                 kind="sandbox.finished",
@@ -695,48 +800,47 @@ def _normalise_relative(path: str) -> str:
     return normalised
 
 
-def _create_network(*, client: Any, name: str) -> Any:
-    """Create the per-task sandbox bridge network (idempotent on name).
+def _create_sandbox_network(*, client: Any, name: str) -> Any:
+    """Create the per-task ``internal: true`` sandbox bridge.
 
-    Design notes / history of this function (read before changing):
+    Why ``internal: true``:
+        Docker installs no MASQUERADE and no default gateway for an
+        internal bridge. Containers attached to it cannot send any
+        packet to an off-bridge destination unless they are *also*
+        attached to a second non-internal network. The agent
+        container is only on this network, so the kernel itself
+        guarantees the agent has no path to the internet. ``unset
+        HTTP_PROXY`` inside the agent does not help — there is no
+        route to set the SYN packet on. ``curl https://1.1.1.1``
+        fails with ``Network is unreachable``.
 
-    1. We *used* to set ``internal=True``. Docker interprets that as
-       "no traffic flows in or out of the network from external
-       sources" — and that turns out to *also* disable host-side DNAT
-       for published ports. With ``internal=True`` the daemon does not
-       start docker-proxy, so ``-p 31xxx:3000`` ends up as a dead
-       mapping that's listed in ``HostConfig.PortBindings`` but has no
-       actual host listener (verified on the Ubuntu acceptance VPS,
-       `curl 127.0.0.1:31xxx/` returned `000`). That broke IP-only /
-       port-mode previews end-to-end.
+    Why this design supersedes the v0.1 plain-bridge approach:
+        v0.1 used a plain bridge so that ``-p 31xxx:3000`` host
+        DNAT worked for IP-only previews, at the cost of leaving the
+        agent with a default route to the internet (cooperative
+        egress only — an agent could ``unset HTTP_PROXY`` and reach
+        raw IPs directly). v0.2 closes that gap by putting the agent
+        on this ``internal: true`` bridge AND adding a per-task
+        forwarder sidecar (see ``_create_forwarder``) that joins
+        both this internal bridge and a separate pub network where
+        host-side DNAT publishes the preview port.
 
-    2. We then *tried* ``com.docker.network.bridge.enable_ip_masquerade
-       =false`` instead. Published ports started working, but Docker's
-       ``network.connect()`` on the multi-homed egress proxy container
-       silently rewrote the proxy's *default gateway* to point at the
-       new (no-masq) sandbox bridge. That made tinyproxy's outbound
-       relay (CONNECT to api.github.com etc.) exit via the no-masq
-       interface, get dropped by the upstream router, and return
-       ``500 Unable to connect`` to the sandbox client. Egress
-       allow-listed traffic was effectively broken across the board.
+    The forwarder + egress-proxy bridge to other networks for their
+    own reasons (see ``_create_forwarder`` and ``_attach_egress_proxy``).
+    """
 
-    3. So we now use a *plain* bridge: not internal, no masquerade
-       override. Docker installs the usual MASQUERADE + DNAT rules,
-       published ports work, and the egress proxy keeps its default
-       gateway on ``infra_default``.
+    existing = client.networks.list(names=[name])
+    if existing:
+        return existing[0]
+    return client.networks.create(name=name, driver="bridge", internal=True)
 
-       The trade-off: in this configuration the kernel does *not*
-       block direct outbound to raw IPs from the sandbox. Egress is
-       gated by the HTTP_PROXY / HTTPS_PROXY env vars (cooperative
-       agent model) plus tinyproxy's hostname allowlist. A determined
-       agent could bypass the proxy by hitting an IP directly. This is
-       acceptable for the IP-only acceptance phase because the agent
-       runtime is *our* code (not adversarial). Closing the bypass
-       requires a per-task port-forwarder sidecar that sits on both a
-       plain bridge (for ``-p`` to work) and an ``internal=true``
-       sandbox bridge (where the agent actually lives) — that's
-       tracked as a v0.2 architectural change, see
-       docs/SANDBOX_EXECUTOR.md "Known limitations".
+
+def _create_public_network(*, client: Any, name: str) -> Any:
+    """Create the per-task public/plain bridge.
+
+    The forwarder sidecar lives on this network and absorbs the host's
+    ``-p 31xxx:3000`` published port via docker-proxy + DNAT. No agent
+    or workload container is ever attached to this network.
     """
 
     existing = client.networks.list(names=[name])
@@ -761,9 +865,8 @@ def _create_container(
     volume_name: str,
     network_name: str,
     environment: dict[str, str],
-    port_bindings: dict[str, int] | None = None,
 ) -> Any:
-    """Create the sandbox container with the full safety profile.
+    """Create the sandbox AGENT container with the full safety profile.
 
     Notes:
     * `nano_cpus` is the SDK's unit for `--cpus`: 1 CPU = 1e9.
@@ -771,8 +874,15 @@ def _create_container(
       for the agent process (Playwright caches, pip wheels, etc.).
     * We do NOT bind-mount the host docker socket; the container has
       no way to reach the host daemon, period.
-    * `port_bindings` is only passed for ``preview_mode='port'`` —
-      Traefik mode keeps the container off the host port table.
+    * No ``ports=`` mapping \u2014 in port mode the forwarder owns the
+      published host port; in traefik mode Traefik reaches the agent
+      over the docker bridge.
+    * ``cap_add=['CHOWN','FOWNER']`` is the minimum needed for the
+      in-container chmod that enforces frontend-first FS protection on
+      agent-owned files. ``DAC_OVERRIDE`` is intentionally NOT added.
+    * ``network`` is set to the internal sandbox bridge \u2014 the agent
+      has no default route to anything except the egress-proxy alias
+      on the same internal subnet.
     """
 
     nano_cpus = int(config.cpus * 1_000_000_000)
@@ -816,13 +926,82 @@ def _create_container(
             "com.aidev.role": "sandbox",
         },
     }
-    if port_bindings:
-        create_kwargs["ports"] = port_bindings
     return client.containers.create(**create_kwargs)
 
 
+def _create_forwarder(
+    *,
+    client: Any,
+    config: SandboxConfig,
+    task_id: str,
+    pub_network_name: str,
+    sandbox_network_name: str,
+    agent_container_name: str,
+    agent_port: int,
+    port_bindings: dict[str, int],
+) -> Any:
+    """Create the per-task preview-forwarder sidecar.
+
+    The forwarder runs ``socat TCP-LISTEN:3000,fork TCP:<agent>:3000``.
+    It is created on the *pub* network (so the host's ``-p 31xxx:3000``
+    DNAT actually has somewhere to deliver packets) and then connected
+    to the *sandbox* network so it can reach the agent by docker DNS.
+
+    Safety:
+    * Non-root UID 10002.
+    * ``cap_drop=ALL`` (no extra caps needed).
+    * ``read_only=True``, no tmpfs needed \u2014 socat does not write disk.
+    * ``no-new-privileges``.
+    * No bind mounts, no docker socket, no shared namespaces.
+    """
+
+    nano_cpus = int(0.5 * 1_000_000_000)  # 0.5 CPU is plenty for socat
+    create_kwargs: dict[str, Any] = {
+        "image": config.forwarder_image,
+        "name": config.forwarder_name(task_id),
+        "user": "10002:10002",
+        "network": pub_network_name,
+        "environment": {
+            "AIDEV_FORWARDER_TARGET": f"{agent_container_name}:{agent_port}",
+            "AIDEV_FORWARDER_LISTEN": str(agent_port),
+        },
+        "read_only": True,
+        "security_opt": ["no-new-privileges:true"],
+        "cap_drop": ["ALL"],
+        "mem_limit": "128m",
+        "nano_cpus": nano_cpus,
+        "pids_limit": 64,
+        "ports": port_bindings,
+        "labels": {
+            "com.aidev.task": task_id,
+            "com.aidev.role": "forwarder",
+        },
+    }
+    forwarder = client.containers.create(**create_kwargs)
+    # Connect to the internal sandbox network so docker DNS resolves
+    # the agent container's name to its sandbox IP.
+    sandbox_net = client.networks.get(sandbox_network_name)
+    try:
+        sandbox_net.connect(forwarder)
+    except Exception as exc:
+        msg = str(exc).lower()
+        if "already" not in msg:
+            logger.warning(
+                "could not connect forwarder to sandbox network: %s", exc
+            )
+    return forwarder
+
+
 def _attach_egress_proxy(*, client: Any, network: Any, alias: str) -> None:
-    """Wire the egress proxy container onto the per-task network."""
+    """Wire the egress proxy container onto the per-task sandbox network.
+
+    The proxy keeps its primary attachment on ``infra_default`` (where
+    it has a working default route to the internet). We add the
+    per-task sandbox bridge as a *second* NIC. Because the sandbox
+    bridge is ``internal: true`` it has no gateway of its own, so
+    adding it does not rewrite the proxy's default route \u2014 verified
+    against Docker 27.x.
+    """
 
     try:
         proxy = client.containers.get(alias)
@@ -840,6 +1019,29 @@ def _attach_egress_proxy(*, client: Any, network: Any, alias: str) -> None:
         msg = str(exc).lower()
         if "already" not in msg:
             logger.warning("could not attach egress proxy to network: %s", exc)
+
+
+def _detach_egress_proxy(*, client: Any, network: Any, alias: str) -> None:
+    """Disconnect the egress proxy from the per-task sandbox network.
+
+    Must be called *before* removing the network \u2014 Docker refuses to
+    remove a network with active endpoints. The proxy's primary
+    attachment on ``infra_default`` is untouched.
+    """
+
+    try:
+        proxy = client.containers.get(alias)
+    except Exception:
+        return
+    try:
+        network.disconnect(proxy, force=True)
+    except Exception as exc:
+        # Not connected is fine; everything else logs.
+        msg = str(exc).lower()
+        if "not connected" not in msg and "no such" not in msg:
+            logger.warning(
+                "could not detach egress proxy from network: %s", exc
+            )
 
 
 def _put_file_into_container(

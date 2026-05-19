@@ -1,10 +1,22 @@
-"""Phase C Pass 2: real DockerSandboxExecutor acceptance walkthrough.
+"""Phase C Pass 2 (v0.2): real DockerSandboxExecutor acceptance walkthrough.
 
-Run inside `infra-sandbox-runner-1` (as root, so the docker socket is
-accessible). The orchestrator in apps/api always uses the mock; this
+Run inside ``infra-sandbox-runner-1`` (as root, so the docker socket is
+accessible). The orchestrator in ``apps/api`` always uses the mock; this
 script exercises the executor end-to-end against the running Docker
 daemon to validate every guarantee called out in
-docs/SANDBOX_EXECUTOR.md sections 1-7 of the manual checklist.
+``docs/SANDBOX_EXECUTOR.md`` plus the v0.2 hardening:
+
+  1. Container safety profile (kernel-level): caps, ro rootfs, npp...
+  2. Dual-network layout: agent on internal sandbox bridge only;
+     forwarder multi-homed; egress-proxy attached to sandbox.
+  3. Agent has NO default route to the internet.
+  4. Direct curl to a raw public IP (1.1.1.1) fails at the kernel.
+  5. ``unset HTTP_PROXY`` still cannot reach the internet.
+  6. Allowed allowlist endpoint (GitHub) works through the proxy.
+  7. Disallowed hostname fails at the proxy.
+  8. Frontend-first FS protection still blocks backend/.env writes.
+  9. Preview URL works end-to-end through the forwarder.
+ 10. Cleanup removes forwarder + agent + both networks + volume.
 """
 from __future__ import annotations
 
@@ -30,9 +42,9 @@ def jdump(label: str, obj: object) -> None:
 
 
 def curl_from_host(client: docker.DockerClient, url: str, timeout: int = 5) -> str:
-    """Curl `url` from a one-shot `--network host` sidecar so that
-    127.0.0.1 means the *VPS host's* loopback (not the sandbox-runner's).
-    Returns the HTTP status code as a string, or '000' on failure.
+    """Curl ``url`` from a one-shot ``--network host`` sidecar so 127.0.0.1
+    means the *VPS host's* loopback (not the sandbox-runner's). Returns
+    the HTTP status code as a string, or ``000`` on failure.
     """
 
     try:
@@ -83,6 +95,7 @@ async def main() -> int:
         "preview_port_range_end": cfg.preview_port_range_end,
         "egress_proxy_url": cfg.egress_proxy_url,
         "egress_proxy_alias": cfg.egress_proxy_alias,
+        "forwarder_image": cfg.forwarder_image,
         "model_server_host": cfg.model_server_host,
         "task_timeout_seconds": cfg.task_timeout_seconds,
     })
@@ -98,14 +111,18 @@ async def main() -> int:
 
     executor = DockerSandboxExecutor(config=cfg, docker_client=client)
     task_id = f"acceptance-{int(time.time())}"
-    network_name = cfg.network_name(task_id)
+    sandbox_net_name = cfg.network_name(task_id)
+    pub_net_name = cfg.public_network_name(task_id)
     volume_name = cfg.volume_name(task_id)
     container_name = cfg.container_name(task_id)
+    forwarder_name = cfg.forwarder_name(task_id)
 
     print(f"  task_id={task_id}")
-    print(f"  container_name={container_name}")
-    print(f"  network_name={network_name}")
-    print(f"  volume_name={volume_name}")
+    print(f"  agent_container={container_name}")
+    print(f"  forwarder_container={forwarder_name}")
+    print(f"  sandbox_network={sandbox_net_name}")
+    print(f"  pub_network={pub_net_name}")
+    print(f"  volume={volume_name}")
 
     banner("1. container safety profile (kernel-level)")
     saved_port = None
@@ -158,37 +175,16 @@ async def main() -> int:
             f"got {cfg_section.get('User')}",
         )
         check(
-            "network is per-task",
-            host_cfg.get("NetworkMode") == network_name,
+            "agent network is per-task sandbox bridge",
+            host_cfg.get("NetworkMode") == sandbox_net_name,
             f"got {host_cfg.get('NetworkMode')}",
         )
-
-        net = client.networks.get(network_name)
-        net.reload()
-        # Sandbox network is a plain bridge (NOT internal=true). See
-        # _create_network's design note: internal=true breaks published
-        # ports and enable_ip_masquerade=false hijacks the proxy's
-        # default gateway. The cooperative HTTP_PROXY egress model is
-        # the documented trade-off.
+        # Agent must NOT publish any host port: that's the forwarder's
+        # job in v0.2.
         check(
-            "network is a plain bridge (port-publish works)",
-            net.attrs.get("Internal") is False
-            and net.attrs.get("Driver") == "bridge",
-            f"internal={net.attrs.get('Internal')} "
-            f"driver={net.attrs.get('Driver')}",
-        )
-
-        ports = host_cfg.get("PortBindings") or {}
-        published = ports.get("3000/tcp")
-        if published:
-            try:
-                saved_port = int(published[0]["HostPort"])
-            except Exception:
-                saved_port = None
-        check(
-            "preview port published 3000/tcp -> host port",
-            saved_port is not None and 31000 <= saved_port <= 31999,
-            f"got {published}",
+            "agent publishes NO host ports",
+            not (host_cfg.get("PortBindings") or {}),
+            f"got {host_cfg.get('PortBindings')}",
         )
 
         mounts = host_cfg.get("Binds") or []
@@ -198,7 +194,211 @@ async def main() -> int:
             f"binds={mounts}",
         )
 
-        banner("2. fs protection blocks backend pre-approval (kernel-level)")
+        banner("2. v0.2 dual-network layout")
+        sandbox_net = client.networks.get(sandbox_net_name)
+        sandbox_net.reload()
+        pub_net = client.networks.get(pub_net_name)
+        pub_net.reload()
+        check(
+            "sandbox network is internal=true",
+            sandbox_net.attrs.get("Internal") is True
+            and sandbox_net.attrs.get("Driver") == "bridge",
+            f"internal={sandbox_net.attrs.get('Internal')} "
+            f"driver={sandbox_net.attrs.get('Driver')}",
+        )
+        check(
+            "pub network is plain bridge (internal=false)",
+            pub_net.attrs.get("Internal") is False
+            and pub_net.attrs.get("Driver") == "bridge",
+            f"internal={pub_net.attrs.get('Internal')} "
+            f"driver={pub_net.attrs.get('Driver')}",
+        )
+
+        # Agent endpoints: only the sandbox bridge should be present.
+        agent_networks = set((c.attrs.get("NetworkSettings") or {}).get(
+            "Networks", {}
+        ).keys())
+        check(
+            "agent is ONLY on the sandbox network (not on pub, not on infra)",
+            agent_networks == {sandbox_net_name},
+            f"agent endpoints={sorted(agent_networks)}",
+        )
+
+        # Forwarder endpoints: on both pub and sandbox.
+        forwarder = client.containers.get(forwarder_name)
+        forwarder.reload()
+        fwd_networks = set(
+            (forwarder.attrs.get("NetworkSettings") or {})
+            .get("Networks", {}).keys()
+        )
+        check(
+            "forwarder is multi-homed on pub + sandbox",
+            fwd_networks == {pub_net_name, sandbox_net_name},
+            f"forwarder endpoints={sorted(fwd_networks)}",
+        )
+
+        # Forwarder must publish 3000/tcp -> 31xxx on the host.
+        fwd_ports = (forwarder.attrs.get("HostConfig") or {}).get(
+            "PortBindings"
+        ) or {}
+        published = fwd_ports.get("3000/tcp")
+        if published:
+            try:
+                saved_port = int(published[0]["HostPort"])
+            except Exception:
+                saved_port = None
+        check(
+            "forwarder publishes 3000/tcp -> host port (31000-31999)",
+            saved_port is not None and 31000 <= saved_port <= 31999,
+            f"got {published}",
+        )
+
+        # Egress proxy must be attached to the sandbox bridge as an
+        # additional NIC (its primary attachment is on infra_default).
+        proxy = client.containers.get(cfg.egress_proxy_alias)
+        proxy.reload()
+        proxy_networks = set(
+            (proxy.attrs.get("NetworkSettings") or {})
+            .get("Networks", {}).keys()
+        )
+        check(
+            "egress proxy attached to per-task sandbox bridge",
+            sandbox_net_name in proxy_networks,
+            f"proxy endpoints={sorted(proxy_networks)}",
+        )
+
+        # Egress proxy default route MUST stay pointed at infra_default's
+        # gateway — joining an internal=true secondary NIC must not hijack
+        # the proxy's default gateway, otherwise all upstream traffic
+        # for every task would break.
+        infra_net = client.networks.get("infra_default")
+        infra_net.reload()
+        infra_gw = None
+        for cfg_entry in (
+            (infra_net.attrs.get("IPAM") or {}).get("Config") or []
+        ):
+            gw = cfg_entry.get("Gateway")
+            if gw and ":" not in gw:
+                infra_gw = gw
+                break
+        proxy_routes_raw = proxy.exec_run(
+            ["ip", "-4", "route", "show", "default"]
+        )
+        proxy_routes = (
+            proxy_routes_raw.output
+            if hasattr(proxy_routes_raw, "output")
+            else proxy_routes_raw[1]
+        )
+        proxy_routes_text = (
+            proxy_routes.decode("utf-8", "replace").strip()
+            if isinstance(proxy_routes, bytes)
+            else str(proxy_routes).strip()
+        )
+        default_lines = [
+            line for line in proxy_routes_text.splitlines()
+            if line.startswith("default ")
+        ]
+        check(
+            "egress-proxy has exactly one default route",
+            len(default_lines) == 1,
+            f"default lines={default_lines}",
+        )
+        check(
+            "egress-proxy default route stays via infra_default gateway "
+            "(NOT rewritten by joining internal sandbox network)",
+            (
+                infra_gw is not None
+                and len(default_lines) == 1
+                and f"via {infra_gw} " in default_lines[0] + " "
+            ),
+            f"infra_default_gw={infra_gw} proxy_default_route={default_lines}",
+        )
+
+        banner("3. agent has NO default route to the internet")
+        routes = await session.run("ip -4 route show", user=10001)
+        default_lines = [
+            ln for ln in routes.stdout.splitlines() if ln.startswith("default ")
+        ]
+        check(
+            "no `default via ...` route in agent's routing table",
+            default_lines == [],
+            f"got: {default_lines!r}",
+        )
+        print(f"  full routes:\n{routes.stdout.rstrip()}")
+
+        banner("4. direct curl to raw public IP fails at the kernel")
+        raw = await session.run(
+            "unset HTTP_PROXY HTTPS_PROXY http_proxy https_proxy NO_PROXY no_proxy; "
+            "curl -sS --connect-timeout 4 -o /dev/null "
+            "-w 'http=%{http_code} exit=%{exitcode}' https://1.1.1.1 "
+            "2>&1 || true",
+            user=10001,
+        )
+        # Kernel-level block on an internal=true bridge surfaces as
+        # ``Network is unreachable`` (curl exit 7). HTTP code stays 000.
+        check(
+            "curl https://1.1.1.1 with proxy env unset fails (no route)",
+            "http=000" in raw.stdout,
+            f"output={raw.stdout.strip()!r}",
+        )
+
+        banner("5. unsetting HTTP_PROXY still cannot reach the internet")
+        bypass = await session.run(
+            "unset HTTP_PROXY HTTPS_PROXY http_proxy https_proxy NO_PROXY no_proxy; "
+            "curl -sS --connect-timeout 5 -o /dev/null "
+            "-w 'http=%{http_code} exit=%{exitcode}' "
+            "https://api.github.com/zen 2>&1 || true",
+            user=10001,
+        )
+        check(
+            "curl GitHub with proxy env unset fails (no route to internet)",
+            "http=000" in bypass.stdout,
+            f"output={bypass.stdout.strip()!r}",
+        )
+
+        banner("6. allowed allowlist endpoint works through proxy")
+        proxy_env = await session.run(
+            "env | grep -E '^(HTTP|HTTPS|NO)_PROXY' || true",
+            user=10001,
+        )
+        print("  proxy env:", proxy_env.stdout.strip())
+
+        gh = await session.run(
+            "curl -sS -o /dev/null --max-time 15 -w '%{http_code}' "
+            "https://api.github.com/zen",
+            user=10001,
+        )
+        check(
+            "egress allowed: api.github.com -> 2xx (through proxy)",
+            gh.stdout.strip().startswith(("200", "201", "204")),
+            f"http={gh.stdout.strip()} rc={gh.returncode}",
+        )
+
+        banner("7. disallowed hostname fails at the proxy")
+        bad = await session.run(
+            "curl -sS -o /dev/null --max-time 10 -w '%{http_code}' "
+            "https://attacker.test",
+            user=10001,
+        )
+        denied_codes = {"403", "502", "504", "000"}
+        check(
+            "egress denied: attacker.test (4xx/5xx/000)",
+            bad.stdout.strip() in denied_codes,
+            f"http={bad.stdout.strip()} rc={bad.returncode}",
+        )
+
+        anchor = await session.run(
+            "curl -sS -o /dev/null --max-time 10 -w '%{http_code}' "
+            "https://github.com.attacker.test",
+            user=10001,
+        )
+        check(
+            "egress regex anchored: github.com.attacker.test denied",
+            anchor.stdout.strip() in denied_codes,
+            f"http={anchor.stdout.strip()} rc={anchor.returncode}",
+        )
+
+        banner("8. fs protection blocks backend pre-approval (kernel-level)")
         # /workspace is owned by the agent UID; only the owner can create
         # new entries because root inside the sandbox does NOT have
         # CAP_DAC_OVERRIDE (we only re-added CHOWN+FOWNER, see
@@ -256,7 +456,7 @@ async def main() -> int:
             f"stderr={frontend_ok.stderr.strip()[:120]}",
         )
 
-        banner("3. BACKEND_UNLOCKED unlocks backend but keeps .env locked")
+        banner("9. BACKEND_UNLOCKED unlocks backend but keeps .env locked")
         await session.set_phase(TaskPhase.BACKEND_UNLOCKED)
         backend_ok = await session.run(
             "echo x > apps/api/main.py", user=10001
@@ -274,60 +474,7 @@ async def main() -> int:
             f"rc={env_still.returncode} stderr={env_still.stderr.strip()[:120]}",
         )
 
-        banner("4. egress allowlist via tinyproxy sidecar")
-        proxy_env = await session.run(
-            "env | grep -E '^(HTTP|HTTPS|NO)_PROXY' || true"
-        )
-        print("  proxy env:", proxy_env.stdout.strip())
-
-        gh = await session.run(
-            "curl -sS -o /dev/null --max-time 15 -w '%{http_code}' "
-            "https://api.github.com/zen"
-        )
-        check(
-            "egress allowed: api.github.com -> 2xx",
-            gh.stdout.strip().startswith(("200", "201", "204")),
-            f"http={gh.stdout.strip()} rc={gh.returncode}",
-        )
-
-        bad = await session.run(
-            "curl -sS -o /dev/null --max-time 10 -w '%{http_code}' "
-            "https://attacker.test"
-        )
-        denied_codes = {"403", "502", "504", "000"}
-        check(
-            "egress denied: attacker.test (4xx/5xx/000)",
-            bad.stdout.strip() in denied_codes,
-            f"http={bad.stdout.strip()} rc={bad.returncode}",
-        )
-
-        anchor = await session.run(
-            "curl -sS -o /dev/null --max-time 10 -w '%{http_code}' "
-            "https://github.com.attacker.test"
-        )
-        check(
-            "egress regex anchored: github.com.attacker.test denied",
-            anchor.stdout.strip() in denied_codes,
-            f"http={anchor.stdout.strip()} rc={anchor.returncode}",
-        )
-
-        bypass = await session.run(
-            "unset HTTP_PROXY HTTPS_PROXY http_proxy https_proxy; "
-            "curl -sS --connect-timeout 5 -o /dev/null "
-            "-w '%{http_code}' https://1.1.1.1"
-        )
-        # Informational: the kernel-level outbound block is NOT enabled
-        # in this build (see _create_network design note). Egress is
-        # gated by HTTP_PROXY env vars + tinyproxy. We log what the
-        # bypass attempt does so the acceptance report can record the
-        # state, but we do not fail the run on it.
-        print(
-            "  [INFO] direct bypass attempt (1.1.1.1 without HTTP_PROXY): "
-            f"http={bypass.stdout.strip()!r} rc={bypass.returncode} "
-            "-- cooperative-egress model, kernel block deferred to v0.2"
-        )
-
-        banner("5. preview registration (port mode)")
+        banner("10. preview registration (port mode via forwarder)")
         # `exec_run(detach=True)` does NOT wait for the command to exit
         # and does NOT kill the child when the RPC returns.
         c.exec_run(
@@ -346,9 +493,9 @@ async def main() -> int:
             print("  preview_url:", session.preview_url)
             host_port = session.port_allocation.host_port
             check(
-                "port_allocation matches host published port",
+                "port_allocation matches forwarder's host published port",
                 host_port == saved_port,
-                f"alloc={host_port} container_pub={saved_port}",
+                f"alloc={host_port} forwarder_pub={saved_port}",
             )
             # First wait for the in-container server to bind.
             for _ in range(20):
@@ -377,7 +524,7 @@ async def main() -> int:
                 client, f"http://127.0.0.1:{host_port}/", timeout=5
             )
             check(
-                "host curl 127.0.0.1:<host_port>/ returns 200",
+                "host curl 127.0.0.1:<host_port>/ returns 200 (via forwarder)",
                 host_code == "200",
                 f"http={host_code!r}",
             )
@@ -394,12 +541,16 @@ async def main() -> int:
         else:
             check("port_allocation set", False, "session.port_allocation is None")
 
-    banner("6. cleanup on exit (DONE happy path)")
-    try:
-        client.containers.get(container_name)
-        check("container removed", False, "container still exists")
-    except docker.errors.NotFound:
-        check("container removed", True)
+    banner("11. cleanup on exit (DONE happy path)")
+    for name, label in [
+        (container_name, "agent container removed"),
+        (forwarder_name, "forwarder container removed"),
+    ]:
+        try:
+            client.containers.get(name)
+            check(label, False, f"{name} still exists")
+        except docker.errors.NotFound:
+            check(label, True)
 
     try:
         client.volumes.get(volume_name)
@@ -407,52 +558,81 @@ async def main() -> int:
     except docker.errors.NotFound:
         check("volume removed", True)
 
-    try:
-        client.networks.get(network_name)
-        check("network removed", False, "network still exists")
-    except docker.errors.NotFound:
-        check("network removed", True)
+    for name, label in [
+        (sandbox_net_name, "sandbox network removed"),
+        (pub_net_name, "pub network removed"),
+    ]:
+        try:
+            client.networks.get(name)
+            check(label, False, f"{name} still exists")
+        except docker.errors.NotFound:
+            check(label, True)
 
-    released = curl_from_host(client, f"http://127.0.0.1:{saved_port}/", timeout=3)
+    # Confirm the egress proxy is no longer attached to the (now-removed)
+    # sandbox network. We do this by enumerating its current endpoints.
+    proxy = client.containers.get(cfg.egress_proxy_alias)
+    proxy.reload()
+    proxy_networks_after = set(
+        (proxy.attrs.get("NetworkSettings") or {}).get("Networks", {}).keys()
+    )
+    check(
+        "egress proxy disconnected from per-task sandbox network",
+        sandbox_net_name not in proxy_networks_after,
+        f"proxy endpoints after cleanup={sorted(proxy_networks_after)}",
+    )
+
+    released = curl_from_host(
+        client, f"http://127.0.0.1:{saved_port}/", timeout=3
+    )
     check(
         "host port released after teardown (curl from host net)",
         released != "200",
         f"http={released!r}",
     )
 
-    banner("7. cleanup on exception (mid-run failure path)")
+    banner("12. cleanup on exception (mid-run failure path)")
     task_id2 = f"acceptance-fail-{int(time.time())}"
-    network_name2 = cfg.network_name(task_id2)
+    sandbox_net2 = cfg.network_name(task_id2)
+    pub_net2 = cfg.public_network_name(task_id2)
     volume_name2 = cfg.volume_name(task_id2)
     container_name2 = cfg.container_name(task_id2)
+    forwarder_name2 = cfg.forwarder_name(task_id2)
 
     class BoomError(RuntimeError):
         pass
 
     try:
-        async with executor.session(task_id=task_id2) as session:
+        async with executor.session(task_id=task_id2):
             print(f"  inside session task_id={task_id2}")
             raise BoomError("simulated agent crash")
     except BoomError:
         print("  caught BoomError (expected)")
 
-    try:
-        client.containers.get(container_name2)
-        check("container cleaned after exception", False)
-    except docker.errors.NotFound:
-        check("container cleaned after exception", True)
+    for name, label in [
+        (container_name2, "agent container cleaned after exception"),
+        (forwarder_name2, "forwarder cleaned after exception"),
+    ]:
+        try:
+            client.containers.get(name)
+            check(label, False)
+        except docker.errors.NotFound:
+            check(label, True)
     try:
         client.volumes.get(volume_name2)
         check("volume cleaned after exception", False)
     except docker.errors.NotFound:
         check("volume cleaned after exception", True)
-    try:
-        client.networks.get(network_name2)
-        check("network cleaned after exception", False)
-    except docker.errors.NotFound:
-        check("network cleaned after exception", True)
+    for name, label in [
+        (sandbox_net2, "sandbox network cleaned after exception"),
+        (pub_net2, "pub network cleaned after exception"),
+    ]:
+        try:
+            client.networks.get(name)
+            check(label, False)
+        except docker.errors.NotFound:
+            check(label, True)
 
-    banner("8. port slot recycled on next allocation")
+    banner("13. port slot recycled on next allocation")
     task_id3 = f"acceptance-recycle-{int(time.time())}"
     async with executor.session(task_id=task_id3) as session:
         rec_port = (

@@ -1,0 +1,7 @@
+# Intentionally empty.
+#
+# `docker/Dockerfile.worker` does `COPY workers/${WORKER}/scripts ./scripts`
+# for every worker. agent-runner does not currently ship any scripts, but
+# the directory must exist so the COPY does not fail when WORKER=agent-runner.
+#
+# sandbox-runner uses scripts/pass2_docker.py for the live acceptance probe.

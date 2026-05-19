@@ -65,17 +65,45 @@ Each task runs in its own Docker container with:
 --tmpfs /tmp:size=512m,exec
 --security-opt no-new-privileges
 --cap-drop ALL
+--cap-add CHOWN --cap-add FOWNER # minimum for fs_protection chmods
 --pids-limit 512
 --cpus 2
 --memory 4g
---network aidev_sandbox          # isolated bridge
+--network aidev_sandbox_<task>   # internal=true, NO default gateway
+                                 # NO host port bindings (forwarder owns them)
 ```
 
 The sandbox container has no host bind-mounts, no docker socket
-inside, and no host network access — it joins a per-task
-`internal: true` Docker network whose only egress is the
-`aidev-egress-proxy` tinyproxy sidecar. The proxy applies an anchored
-regex allowlist (deny-by-default) covering:
+inside, no host network access, and **no host port bindings of its
+own**. Host preview ports are published by a per-task `forwarder`
+sidecar that lives on a separate plain bridge and proxies traffic over
+the internal sandbox network.
+
+### Layer 5 — Kernel-enforced egress (v0.2)
+
+Per-task network layout (see
+[`docs/SANDBOX_EXECUTOR.md#v02-network-layout`](./SANDBOX_EXECUTOR.md#v02-network-layout)
+for the full diagram):
+
+```
+   aidev_pub_<task>           plain bridge      forwarder + docker-proxy live here
+   aidev_sandbox_<task>       internal=true     agent + egress-proxy alias live here
+```
+
+The agent container has **only** the internal bridge as its NIC.
+Because `internal: true` installs no MASQUERADE and no default
+gateway, the kernel's `fib_lookup` refuses every off-bridge address.
+A `curl https://1.1.1.1` from the agent fails with `Network is
+unreachable` even when every proxy env var has been unset. This is
+"kernel-enforced": it is not policy or a guard process, it is the
+absence of a routing-table entry for any destination off the bridge.
+
+The shared `aidev-egress-proxy` (tinyproxy sidecar) is then attached
+to the same internal sandbox bridge as a *second* NIC. Its primary
+NIC stays on `infra_default`, where it has its own default route to
+the internet; the secondary internal attachment is the agent's only
+hop. The proxy applies an anchored regex allowlist (deny-by-default)
+covering:
 
 - the model server (`AIDEV_SANDBOX_MODEL_SERVER_HOST`),
 - GitHub (`*.github.com`, `*.githubusercontent.com`),
@@ -83,6 +111,13 @@ regex allowlist (deny-by-default) covering:
   `registry.yarnpkg.com`),
 - PyPI / Poetry (`pypi.org`, `*.pythonhosted.org`),
 - Debian / Ubuntu OS mirrors.
+
+Two doors must both be open before bytes leave the host:
+
+1. **Kernel door** — must have a route. The agent has none for
+   off-bridge addresses.
+2. **Proxy door** — even on-bridge, only the egress-proxy alias
+   forwards anywhere; it enforces the allowlist.
 
 See [`docs/SANDBOX_EXECUTOR.md`](./SANDBOX_EXECUTOR.md) for the proxy
 design and how to add hosts.

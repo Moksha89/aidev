@@ -29,6 +29,11 @@ COPY workers/${WORKER}/pyproject.toml workers/${WORKER}/poetry.lock* ./
 RUN poetry install --no-root --without dev
 
 COPY workers/${WORKER}/${WORKER//-/_} ./${WORKER//-/_}
+# Optional per-worker scripts (e.g. workers/sandbox-runner/scripts/pass2_docker.py).
+# agent-runner ships an empty scripts/ for build-symmetry; the directory is
+# always copied so operators can `docker exec` acceptance probes in-image
+# without needing `docker cp` from the host.
+COPY workers/${WORKER}/scripts ./scripts
 
 FROM python:3.11-slim-bookworm AS runtime
 ARG WORKER

@@ -1,0 +1,59 @@
+# Per-task preview-forwarder sidecar (v0.2 sandbox executor).
+#
+# What this is:
+#   A tiny socat-only image that sits on TWO docker networks per task:
+#
+#     1. ``aidev_pub_<task>``    — plain bridge, where docker-proxy
+#                                  publishes the host's ``-p 31xxx:3000``
+#                                  port mapping. The forwarder is what
+#                                  *actually* binds the listener.
+#     2. ``aidev_sandbox_<task>`` — ``internal: true`` bridge, where the
+#                                  agent dev server lives on :3000.
+#
+#   Traffic flow:
+#       host :31xxx
+#         -> docker-proxy
+#         -> forwarder :3000 (on aidev_pub_<task>)
+#         -> forwarder TCP-CONNECT (on aidev_sandbox_<task>)
+#         -> agent dev server :3000
+#
+#   Why this exists:
+#     The agent container itself MUST stay on the ``internal: true``
+#     sandbox network only — no default gateway, no MASQUERADE, no
+#     direct internet route. ``-p 31xxx:3000`` on the agent would
+#     require either making the sandbox network non-internal (PR #4's
+#     "cooperative egress" trade-off) or multi-homing the agent onto
+#     a plain bridge (which also gives it an internet route). Neither
+#     is acceptable. The forwarder is a 1-process sidecar that absorbs
+#     the published port on a plain bridge so the agent can stay
+#     isolated.
+#
+#   Why socat:
+#     One static binary, ~250 KB on Alpine. Pure TCP forward — works
+#     transparently for HTTP/1.1, HTTP/2, WebSockets, and Next.js HMR
+#     because we are not parsing the protocol.
+#
+# Build:   docker build -f docker/Dockerfile.forwarder -t aidev/forwarder:latest .
+# Runtime: image expects the env var AIDEV_FORWARDER_TARGET (host:port).
+
+FROM alpine:3.20
+
+# Minimum runtime: just socat. No shell exec needed, no curl, no
+# busybox extras. The image is a single-purpose pipe.
+RUN apk add --no-cache socat \
+    && adduser -D -u 10002 forwarder
+
+USER forwarder:forwarder
+
+# Default forwarder target — overridden per task to point at the
+# agent container's name on the internal sandbox bridge.
+ENV AIDEV_FORWARDER_TARGET=agent:3000 \
+    AIDEV_FORWARDER_LISTEN=3000
+
+EXPOSE 3000
+
+# ``fork`` so multiple browser tabs can connect concurrently;
+# ``reuseaddr`` so a restart on the same port works; ``-d`` once for
+# warning-level logs (avoids the debug spam of ``-d -d``). The shell
+# wrapper is needed to substitute env vars into the socat addresses.
+ENTRYPOINT ["/bin/sh", "-c", "exec socat -d TCP-LISTEN:${AIDEV_FORWARDER_LISTEN},fork,reuseaddr TCP:${AIDEV_FORWARDER_TARGET}"]

@@ -3,8 +3,19 @@
 These tests do NOT spin up real containers — they assert that the
 executor wires the docker-py SDK with the right safety profile
 (non-root, read-only rootfs, no-new-privileges, resource caps,
-internal network), drives the per-task lifecycle in the right order,
-and cleans up on exit.
+v0.2 dual-network layout), drives the per-task lifecycle in the right
+order, and cleans up on exit.
+
+The v0.2 architecture has:
+  * one ``internal: true`` per-task sandbox bridge (agent + egress-proxy)
+  * one plain per-task pub bridge (forwarder only)
+  * one agent container on the sandbox bridge
+  * one forwarder sidecar multi-homed on pub + sandbox
+  * the shared egress-proxy multi-homed onto the sandbox bridge
+
+So every successful session creates 2 networks and 1–2 containers via
+the fake SDK; cleanup must remove the forwarder, disconnect the proxy,
+remove the agent, then remove both networks.
 """
 
 from __future__ import annotations
@@ -96,7 +107,12 @@ class _FakeNetwork:
         self.removed = False
         self.remove_failures = 0  # if >0 the next N remove() calls raise
         self.connections: list[tuple[Any, list[str]]] = []
+        # ``disconnects`` records ids (cleanup-loop pattern from
+        # PR #4); ``disconnections`` records (container, force) tuples
+        # (egress-proxy detach pattern from v0.2). Both are written
+        # by ``disconnect`` so both test styles work.
         self.disconnects: list[Any] = []
+        self.disconnections: list[tuple[Any, bool]] = []
         self.attrs: dict[str, Any] = {"Containers": {}}
 
     def connect(self, container: Any, aliases: list[str] | None = None) -> None:
@@ -111,6 +127,7 @@ class _FakeNetwork:
             container, "id", str(container)
         )
         self.disconnects.append(cid)
+        self.disconnections.append((container, force))
         if isinstance(self.attrs.get("Containers"), dict):
             self.attrs["Containers"].pop(cid, None)
 
@@ -145,6 +162,12 @@ class _FakeNetworks:
         if not names:
             return []
         return [n for n in self.created if n.name in set(names)]
+
+    def get(self, name: str) -> _FakeNetwork:
+        for n in self.created:
+            if n.name == name:
+                return n
+        raise LookupError(name)
 
     def create(
         self,
@@ -303,6 +326,36 @@ def traefik_executor(
 # ---- tests ----------------------------------------------------------------
 
 
+def _agent_container(fake_client: _FakeDocker) -> _FakeContainer:
+    """Pick the agent container out of the fake client.
+
+    Identified by the ``com.aidev.role: sandbox`` label so the test
+    doesn't depend on creation order with the forwarder.
+    """
+
+    for c in fake_client.containers.created:
+        if c.create_kwargs.get("labels", {}).get("com.aidev.role") == "sandbox":
+            return c
+    raise AssertionError("agent container not found in fake client")
+
+
+def _forwarder_container(fake_client: _FakeDocker) -> _FakeContainer:
+    for c in fake_client.containers.created:
+        if (
+            c.create_kwargs.get("labels", {}).get("com.aidev.role")
+            == "forwarder"
+        ):
+            return c
+    raise AssertionError("forwarder container not found in fake client")
+
+
+def _network_by_name(fake_client: _FakeDocker, name: str) -> _FakeNetwork:
+    for n in fake_client.networks.created:
+        if n.name == name:
+            return n
+    raise AssertionError(f"network {name!r} not created")
+
+
 @pytest.mark.asyncio
 async def test_session_applies_full_safety_profile(
     executor: DockerSandboxExecutor, fake_client: _FakeDocker
@@ -312,7 +365,7 @@ async def test_session_applies_full_safety_profile(
         assert session.workspace_path == "/workspace"
         assert session.current_phase == TaskPhase.FRONTEND_CODING
 
-    container = fake_client.containers.created[0]
+    container = _agent_container(fake_client)
     kwargs = container.create_kwargs
 
     # Resource caps
@@ -327,25 +380,25 @@ async def test_session_applies_full_safety_profile(
     # Hardening flags
     assert "no-new-privileges:true" in kwargs["security_opt"]
     assert kwargs["cap_drop"] == ["ALL"]
-    # Re-added caps are the *minimum* needed to make the fs-protection
-    # chmod script work; nothing network/admin/setuid related.
+    # Minimum caps re-added so in-container root can chmod
+    # agent-owned files for the fs-protection layer. DAC_OVERRIDE is
+    # NOT in this list — the protection script does not need it.
     assert kwargs["cap_add"] == ["CHOWN", "FOWNER"]
     # Per-task volume mounted at /workspace
     assert kwargs["volumes"]["aidev-sandbox-vol-t1"] == {
         "bind": "/workspace",
         "mode": "rw",
     }
-    # Per-task sandbox bridge. We had to drop both `internal=True` and
-    # the `enable_ip_masquerade=false` override (see _create_network
-    # docstring for the history). The network is now a plain bridge so
-    # published ports work AND the multi-homed egress proxy keeps its
-    # default gateway on `infra_default`. Egress is enforced by the
-    # HTTP_PROXY env vars + tinyproxy allowlist (cooperative). A
-    # kernel-level bypass block is tracked as a follow-up.
-    network = fake_client.networks.created[0]
-    assert kwargs["network"] == network.name
-    assert network.internal is False
-    assert network.options == {}
+    # v0.2 architecture: the agent's only network is the *internal*
+    # sandbox bridge — kernel-level egress isolation. The plain pub
+    # bridge exists for the forwarder, not the agent.
+    sandbox_net = _network_by_name(fake_client, "aidev_sandbox_t1")
+    pub_net = _network_by_name(fake_client, "aidev_pub_t1")
+    assert kwargs["network"] == sandbox_net.name
+    assert sandbox_net.internal is True
+    assert pub_net.internal is False
+    # The agent must NOT publish a host port — only the forwarder does.
+    assert "ports" not in kwargs
     # Egress proxy env injected
     assert kwargs["environment"]["HTTP_PROXY"] == "http://aidev-egress-proxy:8888"
     assert kwargs["environment"]["HTTPS_PROXY"] == "http://aidev-egress-proxy:8888"
@@ -358,15 +411,37 @@ async def test_session_applies_full_safety_profile(
 async def test_session_cleans_up_on_exit(
     executor: DockerSandboxExecutor, fake_client: _FakeDocker
 ) -> None:
+    # Pre-register the egress proxy so the executor finds it and we
+    # exercise the disconnect-on-exit path.
+    fake_client.containers.create(
+        image="tinyproxy",
+        name="aidev-egress-proxy",
+        labels={"com.aidev.role": "infra"},
+    )
     async with executor.session(task_id="t2"):
         pass
 
-    container = fake_client.containers.created[0]
-    network = fake_client.networks.created[0]
+    agent = _agent_container(fake_client)
+    forwarder = _forwarder_container(fake_client)
+    sandbox_net = _network_by_name(fake_client, "aidev_sandbox_t2")
+    pub_net = _network_by_name(fake_client, "aidev_pub_t2")
     volume = fake_client.volumes.created[0]
-    assert container.removed
-    assert container.remove_kwargs == {"force": True, "v": True}
-    assert network.removed
+
+    # Both containers removed force+volumes
+    assert agent.removed
+    assert agent.remove_kwargs == {"force": True, "v": True}
+    assert forwarder.removed
+    assert forwarder.remove_kwargs == {"force": True, "v": True}
+    # Egress proxy was disconnected from the sandbox bridge before
+    # network removal.
+    assert sandbox_net.disconnections, (
+        "sandbox network must be disconnected from the egress proxy "
+        "before being removed"
+    )
+    # Both networks removed
+    assert sandbox_net.removed
+    assert pub_net.removed
+    # Volume removed
     assert volume.removed
 
 
@@ -410,17 +485,17 @@ async def test_set_phase_runs_protection_script(
     async with executor.session(task_id="t4") as session:
         await session.set_phase(TaskPhase.BACKEND_UNLOCKED)
 
-    container = fake_client.containers.created[0]
-    # Every fs-protection invocation runs as root and execs the
-    # rendered script. We expect at least one such call after
-    # set_phase(BACKEND_UNLOCKED).
+    agent = _agent_container(fake_client)
+    # Every fs-protection invocation runs as root on the agent and
+    # execs the rendered script. We expect at least one such call
+    # after set_phase(BACKEND_UNLOCKED).
     root_protection_calls = [
         c
-        for c in container.exec_calls
+        for c in agent.exec_calls
         if c["user"] == "0"
         and any(".aidev/fs_protection.sh" in str(part) for part in c["cmd"])
     ]
-    assert root_protection_calls, container.exec_calls
+    assert root_protection_calls, agent.exec_calls
 
 
 @pytest.mark.asyncio
@@ -447,16 +522,26 @@ async def test_start_preview_server_registers_traefik_route(
 
 
 @pytest.mark.asyncio
-async def test_port_mode_publishes_host_port_on_container(
+async def test_port_mode_publishes_host_port_on_forwarder_not_agent(
     executor: DockerSandboxExecutor, fake_client: _FakeDocker
 ) -> None:
     async with executor.session(task_id="abc"):
         pass
 
-    container = fake_client.containers.created[0]
-    # Port-mode containers must publish the allocated host port on the
-    # internal preview port.
-    assert container.create_kwargs.get("ports") == {"3000/tcp": 31000}
+    agent = _agent_container(fake_client)
+    forwarder = _forwarder_container(fake_client)
+    # In v0.2 the forwarder owns the host port mapping; the agent
+    # has no host port at all (and lives on internal=true).
+    assert "ports" not in agent.create_kwargs
+    assert forwarder.create_kwargs.get("ports") == {"3000/tcp": 31000}
+    # Forwarder is created on the plain pub bridge and then connected
+    # to the internal sandbox bridge for agent DNS.
+    assert forwarder.create_kwargs["network"] == "aidev_pub_abc"
+    sandbox_net = _network_by_name(fake_client, "aidev_sandbox_abc")
+    assert any(c is forwarder for c, _ in sandbox_net.connections), (
+        "forwarder must be attached to the internal sandbox bridge "
+        "so it can reach the agent by docker DNS"
+    )
 
 
 @pytest.mark.asyncio
@@ -490,10 +575,20 @@ async def test_traefik_mode_does_not_publish_host_ports(
     async with traefik_executor.session(task_id="abc"):
         pass
 
-    container = fake_client.containers.created[0]
-    # Domain-mode containers stay off the host port table — Traefik
-    # reaches them on the docker bridge instead.
-    assert "ports" not in container.create_kwargs
+    agent = _agent_container(fake_client)
+    # Domain-mode agents stay off the host port table — Traefik
+    # reaches them on the docker bridge instead. And in traefik mode
+    # we do NOT spin up a forwarder at all.
+    assert "ports" not in agent.create_kwargs
+    forwarders = [
+        c
+        for c in fake_client.containers.created
+        if c.create_kwargs.get("labels", {}).get("com.aidev.role") == "forwarder"
+    ]
+    assert forwarders == [], (
+        "traefik mode must not create a forwarder — the published "
+        "port architecture is only needed for IP-only/port mode"
+    )
 
 
 @pytest.mark.asyncio
@@ -501,11 +596,10 @@ async def test_run_returns_command_result(
     executor: DockerSandboxExecutor, fake_client: _FakeDocker
 ) -> None:
     async with executor.session(task_id="t5") as session:
-        # Queue an exec result so the run() call below sees stdout.
-        # The container is created during __aenter__, fetch it from the
-        # fake client.
-        container = fake_client.containers.created[0]
-        container.exec_queue.append((0, b"hello\n", b""))
+        # Queue an exec result on the AGENT container so the run() call
+        # below sees stdout. (The forwarder doesn't run exec.)
+        agent = _agent_container(fake_client)
+        agent.exec_queue.append((0, b"hello\n", b""))
         result = await session.run("echo hello")
         assert result.returncode == 0
         assert "hello" in result.stdout
@@ -537,8 +631,8 @@ async def test_capture_changed_files_parses_porcelain(
     executor: DockerSandboxExecutor, fake_client: _FakeDocker
 ) -> None:
     async with executor.session(task_id="t8") as session:
-        container = fake_client.containers.created[0]
-        container.exec_queue.append(
+        agent = _agent_container(fake_client)
+        agent.exec_queue.append(
             (
                 0,
                 b" M apps/web/page.tsx\n?? new.txt\nR  old.txt -> new-name.txt\n",
