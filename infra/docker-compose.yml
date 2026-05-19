@@ -172,9 +172,13 @@ services:
     expose:
       - "2375"
     read_only: true
+    # The image's entrypoint regenerates /usr/local/etc/haproxy/haproxy.cfg
+    # from the env vars on every start, so that directory must be writable.
+    # Everything else stays read-only.
     tmpfs:
       - /run
       - /tmp
+      - /usr/local/etc/haproxy
     cap_drop:
       - ALL
     security_opt:
