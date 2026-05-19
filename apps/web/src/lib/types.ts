@@ -50,6 +50,8 @@ export interface Repository {
   updated_at: string;
 }
 
+export type ExecutionMode = "mock" | "real";
+
 export interface Task {
   id: string;
   project_id: string;
@@ -59,6 +61,14 @@ export interface Task {
   instruction: string;
   phase: TaskPhase;
   active_agent: AgentRole | null;
+  /**
+   * v0.4: ``mock`` (in-process orchestrator with demo data) or ``real``
+   * (Celery agent-runner + Docker sandbox + real GitHub PR). Set when
+   * the task starts and used by the dashboard to label rows; the API
+   * uses it to decide which branch of the approval / reject paths to
+   * drive.
+   */
+  execution_mode: ExecutionMode;
   branch_name: string | null;
   preview_url: string | null;
   pr_url: string | null;
@@ -66,6 +76,25 @@ export interface Task {
   error_message: string | null;
   created_at: string;
   updated_at: string;
+}
+
+/**
+ * Mirror of ``GET /settings/runtime``. Used by the runtime banner on
+ * the dashboard topbar so the operator can see at a glance which
+ * executor + pipeline are wired and whether GitHub credentials are
+ * installed.
+ *
+ * Source of truth: ``apps/api/app/routes/settings.py::get_runtime_status``.
+ */
+export interface RuntimeStatus {
+  sandbox_executor: "mock" | "docker";
+  agent_pipeline: "mock" | "real";
+  github_configured: boolean;
+  github_mode: "token" | "app" | null;
+  real_pipeline_active: boolean;
+  model_base_url: string;
+  model_name: string;
+  env: "development" | "staging" | "production";
 }
 
 export interface TaskLog {

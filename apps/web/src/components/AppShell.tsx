@@ -1,3 +1,4 @@
+import { RuntimeBadge } from "@/components/RuntimeBadge";
 import { Sidebar } from "@/components/Sidebar";
 
 export function AppShell({ children }: { children: React.ReactNode }) {
@@ -14,10 +15,11 @@ export function AppShell({ children }: { children: React.ReactNode }) {
 
 function Topbar() {
   return (
-    <header className="sticky top-0 z-10 h-14 border-b bg-background flex items-center gap-3 px-4">
+    <header className="sticky top-0 z-10 h-14 border-b bg-background flex items-center justify-between gap-3 px-4">
       <p className="text-sm text-muted-foreground">
         Frontend-first mode. Backend changes require explicit approval.
       </p>
+      <RuntimeBadge />
     </header>
   );
 }

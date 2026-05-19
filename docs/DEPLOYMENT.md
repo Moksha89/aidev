@@ -175,16 +175,25 @@ AIDEV_SANDBOX_PREVIEW_HOST=<ubuntu-vps-ip>
 AIDEV_SANDBOX_PREVIEW_PORT_RANGE_START=31000
 AIDEV_SANDBOX_PREVIEW_PORT_RANGE_END=31999
 
-# Keep the executor on mock for the first acceptance pass, then switch to
-# docker once the dashboard/API/GitHub/model paths are confirmed:
-SANDBOX_EXECUTOR=mock     # change to "docker" only for the second pass
+# v0.4 dual-flag opt-in. Both default to "mock" -- the deployed
+# platform stays mocked end-to-end until BOTH are flipped:
+SANDBOX_EXECUTOR=mock          # "mock" | "docker"
+AIDEV_AGENT_PIPELINE=mock      # "mock" | "real"
 
 # Everything else:
 POSTGRES_PASSWORD=<generate-a-strong-one>
 MODEL_BASE_URL=http://host.docker.internal:11434/v1
-# Optional, only if you want GitHub PR creation in the sandbox:
-GITHUB_TOKEN=<short-lived-token-or-leave-unset-for-acceptance>
+# Optional, only if you want real PR creation in the v0.4 pipeline.
+# Stays scoped to the throwaway smoketest repo for the supervised run:
+AIDEV_GITHUB_TOKEN=<short-lived-PAT-or-leave-unset-for-mock>
 ```
+
+> The two flags **must move together**: setting only
+> `SANDBOX_EXECUTOR=docker` keeps the dashboard's in-process mock
+> orchestrator (which never calls the sandbox) and setting only
+> `AIDEV_AGENT_PIPELINE=real` enqueues Celery jobs that immediately
+> refuse because their executor is still `mock`. See
+> [`docs/AGENT_PIPELINE.md`](./AGENT_PIPELINE.md).
 
 Do **not** set `AIDEV_DOMAIN`, `AIDEV_SANDBOX_PREVIEW_DOMAIN`,
 `ACME_EMAIL`, or any DNS-provider tokens in IP-only mode — they are

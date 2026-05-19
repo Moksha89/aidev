@@ -154,6 +154,43 @@ def list_servers(current: User = Depends(get_current_user)) -> dict[str, object]
     }
 
 
+# --------------------------------------------------------------- runtime
+
+
+@router.get("/runtime")
+def get_runtime_status(
+    current: User = Depends(get_current_user),
+) -> dict[str, object]:
+    """Runtime mode + capabilities for the dashboard banner.
+
+    v0.4 surface so the dashboard can show:
+      * which executor the sandbox-runner uses (``mock`` / ``docker``)
+      * which agent pipeline the API dispatches to (``mock`` / ``real``)
+      * whether GitHub credentials are installed
+      * whether the real pipeline is actually reachable (both flags on)
+
+    Never returns the GitHub token or any secret material.
+    """
+    del current
+    s = get_settings()
+    github_configured = bool(s.github_token) or bool(s.github_app_id)
+    real_pipeline_active = (
+        s.agent_pipeline == "real" and s.sandbox_executor == "docker"
+    )
+    return {
+        "sandbox_executor": s.sandbox_executor,
+        "agent_pipeline": s.agent_pipeline,
+        "github_configured": github_configured,
+        "github_mode": (
+            "token" if s.github_token else ("app" if s.github_app_id else None)
+        ),
+        "real_pipeline_active": real_pipeline_active,
+        "model_base_url": s.model_base_url,
+        "model_name": s.model_name,
+        "env": s.aidev_env,
+    }
+
+
 def _redact(url: str) -> str:
     """Hide creds in a URL like `redis://:password@host:port/0`."""
     if "@" not in url:

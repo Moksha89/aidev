@@ -24,6 +24,14 @@ WORKDIR /app
 # Path deps in workers/*/pyproject.toml reference ../../packages/*, so from
 # /app the relative path resolves to /packages/* — copy there, not /app/packages.
 COPY packages /packages
+# v0.4: the agent-runner image embeds the sandbox-runner package because
+# the real pipeline imports ``sandbox_runner.docker_executor`` directly
+# (no IPC hop between agent-runner and sandbox-runner). We copy it at
+# /sandbox-runner so the path dep ``../sandbox-runner`` in
+# workers/agent-runner/pyproject.toml resolves; the directory is also
+# copied for sandbox-runner builds (harmless self-copy) so a single
+# Dockerfile keeps working for both targets.
+COPY workers/sandbox-runner /sandbox-runner
 COPY workers/${WORKER}/pyproject.toml workers/${WORKER}/poetry.lock* ./
 
 RUN poetry install --no-root --without dev

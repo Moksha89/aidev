@@ -25,6 +25,7 @@ class TaskRead(BaseModel):
     instruction: str
     phase: str
     active_agent: str | None
+    execution_mode: str
     branch_name: str | None
     preview_url: str | None
     pr_url: str | None

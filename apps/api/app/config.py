@@ -60,11 +60,35 @@ class Settings(BaseSettings):
     )
 
     # --- GitHub ---
-    github_token: str | None = None
-    github_app_id: int | None = None
-    github_app_private_key_path: str | None = None
-    github_app_installation_id: int | None = None
-    github_webhook_secret: str | None = None
+    # ``AIDEV_GITHUB_TOKEN`` is the v0.4 canonical name (also documented
+    # in ``infra/.env.example``); ``GITHUB_TOKEN`` is accepted as a
+    # fallback so existing deployments keep working unchanged.
+    github_token: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("AIDEV_GITHUB_TOKEN", "GITHUB_TOKEN"),
+    )
+    github_app_id: int | None = Field(
+        default=None,
+        validation_alias=AliasChoices("AIDEV_GITHUB_APP_ID", "GITHUB_APP_ID"),
+    )
+    github_app_private_key_path: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "AIDEV_GITHUB_APP_PRIVATE_KEY_PATH", "GITHUB_APP_PRIVATE_KEY_PATH"
+        ),
+    )
+    github_app_installation_id: int | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "AIDEV_GITHUB_APP_INSTALLATION_ID", "GITHUB_APP_INSTALLATION_ID"
+        ),
+    )
+    github_webhook_secret: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "AIDEV_GITHUB_WEBHOOK_SECRET", "GITHUB_WEBHOOK_SECRET"
+        ),
+    )
 
     # --- CORS ---
     cors_origins: str = Field(
@@ -84,6 +108,19 @@ class Settings(BaseSettings):
 
     # --- sandbox ---
     sandbox_executor: Literal["mock", "docker"] = "mock"
+
+    # --- agent pipeline ---
+    # v0.4: `mock` (default) keeps the in-process orchestrator that ships
+    # demo data; `real` enqueues the Celery agent-runner pipeline that
+    # spawns the real Docker sandbox, calls the local model server, and
+    # opens a real PR on the connected repository. The real path also
+    # requires ``sandbox_executor=docker``; if either flag is missing the
+    # API falls back to the mock orchestrator so dashboard tasks never
+    # touch a real repository.
+    agent_pipeline: Literal["mock", "real"] = Field(
+        default="mock",
+        validation_alias=AliasChoices("AIDEV_AGENT_PIPELINE", "AGENT_PIPELINE"),
+    )
 
     # --- misc ---
     audit_retention_days: int = 365

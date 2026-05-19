@@ -185,6 +185,47 @@ See [`docs/ROOTLESS_DOCKER.md`](./ROOTLESS_DOCKER.md) for the
 feasibility analysis of rootless Docker as the next layer beyond
 v0.3.
 
+### Layer 7 — Real agent pipeline opt-in (v0.4)
+
+Before v0.4 the dashboard's task lifecycle was a fully in-process
+mock — clicking "Start task" never actually invoked the
+sandbox-runner, never cloned a repo, never opened a real PR. Flipping
+`SANDBOX_EXECUTOR=docker` on its own had no effect on dashboard
+tasks.
+
+v0.4 introduces the real pipeline (Celery → agent-runner → sandbox)
+behind a **deliberately double-gated** opt-in:
+
+1. **`AIDEV_AGENT_PIPELINE=real`** — switches the API dispatcher
+   from "run the mock orchestrator in-process" to "enqueue a Celery
+   job to `agent_runner.tasks.run_task`".
+2. **`SANDBOX_EXECUTOR=docker`** — selects the real
+   `DockerSandboxExecutor` over the in-process `MockSandboxExecutor`.
+3. **`task.repository_id is not None`** — the dispatcher refuses to
+   enter real mode for a task that has no connected repository row,
+   regardless of the operator flags. This is the structural guarantee
+   that a real-pipeline task can never modify an arbitrary repo —
+   only one explicitly attached to the task in the DB.
+
+If *any* of those three conditions is false, the dispatcher
+transparently falls back to the mock orchestrator. The deployed
+defaults are `agent_pipeline=mock` and `sandbox_executor=mock`, so
+the safe path is the only path until the operator opts in.
+
+The agent-runner re-checks `AgentRunnerConfig.real_pipeline_active`
+on every Celery message and refuses to do any work if the flags are
+not both set, defending against a stale message landing on a
+mis-configured worker. The dispatcher decision is logged at INFO so
+the operator can audit which mode each task ran in.
+
+The post-approval push uses the same gate keyed off the task's
+**stored** `execution_mode`, not the live setting — flipping the
+flag mid-flight does not surprise a half-run task with the wrong
+pipeline.
+
+See [`docs/AGENT_PIPELINE.md`](./AGENT_PIPELINE.md) for the full
+dispatcher and pipeline walkthrough.
+
 ## Secret management
 
 - `.env` files are loaded via `pydantic-settings` and never logged.

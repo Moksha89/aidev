@@ -56,6 +56,17 @@ services:
       AIDEV_ADMIN_EMAIL: ${AIDEV_ADMIN_EMAIL:-admin@example.com}
       AIDEV_ADMIN_PASSWORD: ${AIDEV_ADMIN_PASSWORD:?required}
       AIDEV_CORS_ORIGINS: ${AIDEV_CORS_ORIGINS:-http://localhost:3000}
+      # v0.4 pipeline flags. The API uses these (alongside
+      # SANDBOX_EXECUTOR) to decide whether to enqueue Celery
+      # (`real`+`docker`) or run the in-process mock orchestrator
+      # (anything else).
+      AIDEV_AGENT_PIPELINE: ${AIDEV_AGENT_PIPELINE:-mock}
+      SANDBOX_EXECUTOR: ${SANDBOX_EXECUTOR:-mock}
+      # PAT scoped to the throwaway smoketest repo only — never to a
+      # real project. Leave unset to disable real-mode PR creation;
+      # the API's /settings/runtime endpoint reports
+      # github_configured=false in that case.
+      AIDEV_GITHUB_TOKEN: ${AIDEV_GITHUB_TOKEN:-}
     # IP-only acceptance: publish the API on the host so it's reachable
     # at http://<vps-ip>:8000. The Traefik labels below are inert in
     # IP-only mode (the `traefik` service is profile-gated) and only
