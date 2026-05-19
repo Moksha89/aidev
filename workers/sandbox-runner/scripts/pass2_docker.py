@@ -267,6 +267,53 @@ async def main() -> int:
             f"proxy endpoints={sorted(proxy_networks)}",
         )
 
+        # Egress proxy default route MUST stay pointed at infra_default's
+        # gateway — joining an internal=true secondary NIC must not hijack
+        # the proxy's default gateway, otherwise all upstream traffic
+        # for every task would break.
+        infra_net = client.networks.get("infra_default")
+        infra_net.reload()
+        infra_gw = None
+        for cfg_entry in (
+            (infra_net.attrs.get("IPAM") or {}).get("Config") or []
+        ):
+            gw = cfg_entry.get("Gateway")
+            if gw and ":" not in gw:
+                infra_gw = gw
+                break
+        proxy_routes_raw = proxy.exec_run(
+            ["ip", "-4", "route", "show", "default"]
+        )
+        proxy_routes = (
+            proxy_routes_raw.output
+            if hasattr(proxy_routes_raw, "output")
+            else proxy_routes_raw[1]
+        )
+        proxy_routes_text = (
+            proxy_routes.decode("utf-8", "replace").strip()
+            if isinstance(proxy_routes, bytes)
+            else str(proxy_routes).strip()
+        )
+        default_lines = [
+            line for line in proxy_routes_text.splitlines()
+            if line.startswith("default ")
+        ]
+        check(
+            "egress-proxy has exactly one default route",
+            len(default_lines) == 1,
+            f"default lines={default_lines}",
+        )
+        check(
+            "egress-proxy default route stays via infra_default gateway "
+            "(NOT rewritten by joining internal sandbox network)",
+            (
+                infra_gw is not None
+                and len(default_lines) == 1
+                and f"via {infra_gw} " in default_lines[0] + " "
+            ),
+            f"infra_default_gw={infra_gw} proxy_default_route={default_lines}",
+        )
+
         banner("3. agent has NO default route to the internet")
         routes = await session.run("ip -4 route show", user=10001)
         default_lines = [

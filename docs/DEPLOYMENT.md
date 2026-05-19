@@ -180,7 +180,27 @@ Do **not** set `AIDEV_DOMAIN`, `AIDEV_SANDBOX_PREVIEW_DOMAIN`,
 `ACME_EMAIL`, or any DNS-provider tokens in IP-only mode — they are
 ignored and only used by the production (Traefik+TLS) mode.
 
-### 5. Bring it up
+### 5. Build the sandbox + forwarder images
+
+The sandbox-runner orchestrator needs two images pre-built **outside of
+docker-compose**, because compose only builds the platform services
+(api, web, workers, traefik, postgres, redis). These two images are
+launched directly by the Docker SDK per task:
+
+```bash
+# Per-task agent sandbox (node + python + playwright + gh):
+docker build -f docker/Dockerfile.sandbox -t aidev/sandbox:latest .
+
+# Per-task preview forwarder (v0.2, alpine + socat). Required as soon as
+# SANDBOX_EXECUTOR=docker — the executor will fail at session start if
+# this image is missing.
+docker build -f docker/Dockerfile.forwarder -t aidev/forwarder:latest .
+
+docker image ls aidev/sandbox aidev/forwarder
+# expect both images listed
+```
+
+### 6. Bring it up
 
 ```bash
 docker compose up -d --build
@@ -197,7 +217,7 @@ curl -sI http://<ubuntu-vps-ip>:3000 | head -1
 # expect: HTTP/1.1 200 OK
 ```
 
-### 6. Firewall (IP-only)
+### 7. Firewall (IP-only)
 
 ```bash
 sudo ufw default deny incoming
@@ -217,7 +237,7 @@ Postgres (`5432`), Redis (`6379`), and the model server (`11434`) stay
 internal — they are only reachable on the Docker bridge and **must not**
 be opened on the host.
 
-### 7. Acceptance checklist
+### 8. Acceptance checklist
 
 Run every section of `docs/SANDBOX_EXECUTOR.md` § "Manual acceptance
 checklist". Record results in
@@ -229,10 +249,25 @@ The two-pass acceptance sequence:
    config, model config, task chat, approval-gate, log streaming and
    diff/screenshot viewers all work end-to-end with the mock executor.
 2. **Pass 2 — `SANDBOX_EXECUTOR=docker`:** edit `infra/.env`, run
-   `docker compose up -d --build sandbox-runner`, then walk every
-   sandbox-specific section (safety profile, FS protection, `.env`
-   lock, egress allowlist, port-mode preview creation/removal, cleanup,
-   timeout handling, Redis observability).
+   `docker compose up -d --build sandbox-runner`, then run the v0.2
+   live acceptance probe (now baked into the worker image at
+   `/app/scripts/pass2_docker.py`):
+
+   ```bash
+   docker exec --user 0 \
+       -e PYTHONPATH=/app \
+       -w /app \
+       infra-sandbox-runner-1 \
+       python /app/scripts/pass2_docker.py
+   ```
+
+   Expect `ALL CHECKS PASSED` covering safety profile, dual-network
+   layout, no default route in agent, raw-IP+unset-proxy both fail,
+   egress allowlist works, denylist fails, FS protection,
+   BACKEND_UNLOCKED, preview through forwarder, normal + exception
+   cleanup, port slot recycle, and that the egress-proxy's default
+   route stays pinned to `infra_default` after it joins the per-task
+   internal sandbox bridge.
 
 Do **not** open the platform to real project tasks until the
 checklist is fully recorded and you've explicitly approved the next
